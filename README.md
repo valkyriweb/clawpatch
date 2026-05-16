@@ -47,7 +47,11 @@ validation commands and records a patch attempt under `.clawpatch/`.
 - npm package bins
 - selected root and workspace package scripts: `start`, `build`, `test`,
   `lint`, `typecheck`, `format`
-- Next.js `app/` and `pages/` routes
+- Node/TypeScript workspace packages under `apps/*`, `packages/*`, and package
+  workspace patterns
+- Nx project metadata from `project.json`, including project-scoped validation
+  targets
+- Next.js `app/` and `pages/` routes, including routes inside monorepo apps
 - Go package slices from `go list ./...`, including command packages
 - Go package tests and same-repo imports as review context
 - Java/Kotlin Gradle source groups and root Gradle build/test commands
@@ -110,6 +114,7 @@ Useful flags:
 - `--limit <n>`
 - `--jobs <n>`
 - `--feature <id>`
+- `--project <name-or-root>`
 - `--finding <id>`
 - `--status <status>`
 - `--severity <severity>`

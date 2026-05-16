@@ -243,8 +243,14 @@ export async function reportCommand(
     readFindings(loaded.paths),
     readFeatures(loaded.paths),
   ]);
-  const filtered = filterFindings(findings, flags);
-  const output = renderReport(filtered, features, {
+  const projectFilter = stringFlag(flags, "project");
+  const scopedFeatures = filterFeaturesByProject(features, projectFilter);
+  const filtered = filterFindingsByFeatures(
+    filterFindings(findings, flags),
+    scopedFeatures,
+    projectFilter,
+  );
+  const output = renderReport(filtered, scopedFeatures, {
     includeNext: stringFlag(flags, "status") !== undefined,
   });
   const outputPath = typeof flags["output"] === "string" ? resolve(flags["output"]) : null;
@@ -255,7 +261,7 @@ export async function reportCommand(
     return {
       findings: filtered.length,
       output: outputPath,
-      items: findingSummaries(filtered, features),
+      items: findingSummaries(filtered, scopedFeatures),
     };
   }
   return {
@@ -305,7 +311,15 @@ export async function nextCommand(
     readFeatures(loaded.paths),
   ]);
   const status = stringFlag(flags, "status") ?? "open";
-  const selected = nextFinding(findings.filter((finding) => finding.status === status));
+  const projectFilter = stringFlag(flags, "project");
+  const scopedFeatures = filterFeaturesByProject(features, projectFilter);
+  const selected = nextFinding(
+    filterFindingsByFeatures(
+      findings.filter((finding) => finding.status === status),
+      scopedFeatures,
+      projectFilter,
+    ),
+  );
   if (selected === null) {
     return { finding: null, status, next: "clawpatch report --status open" };
   }
@@ -918,9 +932,13 @@ function selectReviewCandidates(
   flags: Record<string, string | boolean>,
 ): FeatureRecord[] {
   const featureId = stringFlag(flags, "feature");
-  return featureId === undefined
-    ? features.filter((feature) => ["pending", "error"].includes(feature.status))
-    : features.filter((feature) => feature.featureId === featureId);
+  const projectFilter = stringFlag(flags, "project");
+  const projectFeatures = filterFeaturesByProject(features, projectFilter);
+  const selected =
+    featureId === undefined
+      ? projectFeatures.filter((feature) => ["pending", "error"].includes(feature.status))
+      : projectFeatures.filter((feature) => feature.featureId === featureId);
+  return projectFilter === undefined ? selected : selected.toSorted(featureReviewRank);
 }
 
 async function filterFeaturesByFilesSince(
@@ -977,6 +995,92 @@ function limitFeatures(
 ): FeatureRecord[] {
   const limit = Number(stringFlag(flags, "limit") ?? "1");
   return features.slice(0, Number.isFinite(limit) && limit > 0 ? limit : 1);
+}
+
+function filterFeaturesByProject(
+  features: FeatureRecord[],
+  project: string | undefined,
+): FeatureRecord[] {
+  if (project === undefined) {
+    return features;
+  }
+  const normalized = normalizeProjectFilter(project);
+  return features.filter((feature) => featureMatchesProject(feature, project, normalized));
+}
+
+function filterFindingsByFeatures(
+  findings: FindingRecord[],
+  features: FeatureRecord[],
+  project: string | undefined,
+): FindingRecord[] {
+  if (project === undefined) {
+    return findings;
+  }
+  const featureIds = new Set(features.map((feature) => feature.featureId));
+  return findings.filter((finding) => featureIds.has(finding.featureId));
+}
+
+function featureMatchesProject(
+  feature: FeatureRecord,
+  rawProject: string,
+  normalizedProject: string,
+): boolean {
+  if (
+    feature.tags.includes(`project:${rawProject}`) ||
+    feature.tags.includes(`project:${normalizedProject}`) ||
+    feature.tags.includes(`project-root:${normalizedProject}`)
+  ) {
+    return true;
+  }
+  if (normalizedProject === ".") {
+    return feature.tags.includes("project-root:.");
+  }
+  return featurePaths(feature).some(
+    (path) => path === normalizedProject || path.startsWith(`${normalizedProject}/`),
+  );
+}
+
+function featurePaths(feature: FeatureRecord): string[] {
+  return [
+    ...feature.entrypoints.map((entrypoint) => entrypoint.path),
+    ...feature.ownedFiles.map((file) => file.path),
+    ...feature.contextFiles.map((file) => file.path),
+    ...feature.tests.map((test) => test.path),
+  ].map(normalizePath);
+}
+
+function normalizeProjectFilter(project: string): string {
+  const normalized = normalizePath(project).replace(/^\.\//u, "");
+  return normalized.length === 0 ? "." : normalized;
+}
+
+function featureReviewRank(left: FeatureRecord, right: FeatureRecord): number {
+  return (
+    featureStatusRank(left) - featureStatusRank(right) ||
+    featureSourceRank(left) - featureSourceRank(right) ||
+    left.title.localeCompare(right.title) ||
+    left.featureId.localeCompare(right.featureId)
+  );
+}
+
+function featureStatusRank(feature: FeatureRecord): number {
+  return feature.status === "error" ? 0 : 1;
+}
+
+function featureSourceRank(feature: FeatureRecord): number {
+  if (feature.source.startsWith("next-")) {
+    return 0;
+  }
+  if (feature.source === "package-json-bin") {
+    return 1;
+  }
+  if (feature.source === "node-source-group") {
+    return 2;
+  }
+  if (feature.source === "node-package") {
+    return 3;
+  }
+  return 4;
 }
 
 function reviewJobs(flags: Record<string, string | boolean>): number {

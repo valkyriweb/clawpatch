@@ -29,8 +29,9 @@ Supported deterministic mappers today:
 - npm package bins
 - selected root and workspace package scripts
 - Node/TypeScript workspace packages from `package.json` workspaces, `pnpm-workspace.yaml`, and common package folders
+- Nx project metadata from `project.json`, including project names, source roots, project types, and target names
 - bounded Node/TypeScript source groups under `src/`, `lib/`, `app/`, `pages/`, and `scripts/`
-- Next.js `app/` and `pages/` routes
+- Next.js `app/` and `pages/` routes at the repo root or inside discovered monorepo projects
 - Go `cmd/*/main.go`
 - Go `internal/*` packages
 - Python project metadata, console scripts, root app files, bounded source groups,
@@ -54,6 +55,22 @@ files. Package-local tests and package context files are attached when they can
 be found cheaply.
 Selected `package.json` scripts are mapped for the root package and discovered
 workspace packages, with workspace script titles including the package name.
+
+In JavaScript/TypeScript monorepos, project discovery runs before framework
+mapping. Workspace packages and Nx projects are normalized into project roots,
+so framework mappers can apply the same heuristics to `apps/*` and `packages/*`
+that they apply at the repository root. Feature tags include project name and
+project root metadata, enabling commands such as:
+
+```bash
+clawpatch review --project apps/web --limit 10
+clawpatch review --project web --limit 10
+clawpatch report --project web --status open
+clawpatch next --project web
+```
+
+When an Nx project target is available, nearby tests use the project-scoped
+command, such as `yarn nx test web`, instead of a repository-wide test command.
 
 Native app mappers use the same bounded grouping model. SwiftPM packages can be
 discovered below the repo root, Apple projects are grouped by Swift source area,
@@ -83,4 +100,5 @@ Known gaps:
 - no Express/Fastify/Hono route mapper yet
 - no Django route mapper yet
 - no import graph expansion beyond nearby tests yet
+- no Turborepo task metadata mapper yet
 - no agent enrichment yet

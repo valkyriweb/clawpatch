@@ -176,9 +176,12 @@ describe("workflow", () => {
   });
 
   it("parses review jobs and report filters", () => {
-    expect(parseArgs(["review", "--limit", "4", "--jobs", "3"]).flags).toMatchObject({
+    expect(
+      parseArgs(["review", "--limit", "4", "--jobs", "3", "--project", "apps/web"]).flags,
+    ).toMatchObject({
       limit: "4",
       jobs: "3",
+      project: "apps/web",
     });
     expect(parseArgs(["review", "--since", "HEAD~5"]).flags).toMatchObject({
       since: "HEAD~5",
@@ -186,9 +189,12 @@ describe("workflow", () => {
     expect(parseArgs(["revalidate", "--since", "origin/main"]).flags).toMatchObject({
       since: "origin/main",
     });
-    expect(parseArgs(["report", "--status", "open", "--severity", "high"]).flags).toMatchObject({
+    expect(
+      parseArgs(["report", "--status", "open", "--severity", "high", "--project", "web"]).flags,
+    ).toMatchObject({
       status: "open",
       severity: "high",
+      project: "web",
     });
     expect(
       parseArgs(["triage", "--finding", "f", "--status", "wont-fix", "--note", "ok"]).flags,
@@ -704,6 +710,71 @@ describe("workflow", () => {
     const features = await readFeatures(statePaths(join(root, ".clawpatch")));
 
     expect(features[0]?.status).toBe("pending");
+  });
+
+  it("filters review dry-runs by project name or root", async () => {
+    const root = await fixtureRoot("clawpatch-project-filter-");
+    await writeFixture(
+      root,
+      "package.json",
+      JSON.stringify({ name: "workspace-root", workspaces: ["apps/*"] }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/web/package.json",
+      JSON.stringify({ name: "web", dependencies: { next: "1.0.0" } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/web/project.json",
+      JSON.stringify({ name: "web", targets: { test: {} } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/web/src/app/dashboard/page.tsx",
+      "export default function Page() { return null; }\n",
+    );
+    await writeFixture(
+      root,
+      "apps/admin/package.json",
+      JSON.stringify({ name: "admin", dependencies: { next: "1.0.0" } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/admin/project.json",
+      JSON.stringify({ name: "admin", targets: { test: {} } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/admin/src/app/dashboard/page.tsx",
+      "export default function Page() { return null; }\n",
+    );
+    const context = await makeContext(testOptions(root));
+
+    await initCommand(context, {});
+    await mapCommand(context);
+    const byRoot = (await reviewCommand(context, {
+      dryRun: true,
+      project: "apps/web",
+      limit: "20",
+    })) as { featureIds: string[]; wouldReview: number };
+    const byName = (await reviewCommand(context, {
+      dryRun: true,
+      project: "web",
+      limit: "20",
+    })) as { featureIds: string[]; wouldReview: number };
+    const features = await readFeatures(statePaths(join(root, ".clawpatch")));
+    const titleById = new Map(features.map((feature) => [feature.featureId, feature.title]));
+
+    expect(byRoot.wouldReview).toBeGreaterThan(0);
+    expect(byRoot.featureIds).toEqual(byName.featureIds);
+    expect(byRoot.featureIds.map((id) => titleById.get(id))).toEqual(
+      expect.arrayContaining(["Node package web", "web route /dashboard"]),
+    );
+    expect(byRoot.featureIds.map((id) => titleById.get(id))).not.toContain("Node package admin");
+    expect(byRoot.featureIds.map((id) => titleById.get(id))).not.toContain(
+      "admin route /dashboard",
+    );
   });
 
   it("does not mutate features on dry-run map", async () => {

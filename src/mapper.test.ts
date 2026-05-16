@@ -138,6 +138,137 @@ describe("mapFeatures", () => {
     expect(titles).not.toContain("Route /_error");
   });
 
+  it("maps Next routes inside Nx workspace projects", async () => {
+    const root = await fixtureRoot("clawpatch-map-next-nx-workspace-");
+    await writeFixture(
+      root,
+      "package.json",
+      JSON.stringify({ name: "workspace-root", workspaces: ["apps/*"] }, null, 2),
+    );
+    await writeFixture(root, "yarn.lock", "");
+    await writeFixture(
+      root,
+      "apps/web/package.json",
+      JSON.stringify({ name: "web", dependencies: { next: "1.0.0" } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/web/project.json",
+      JSON.stringify(
+        {
+          name: "web",
+          sourceRoot: "apps/web/src",
+          projectType: "application",
+          targets: { test: {}, lint: {} },
+        },
+        null,
+        2,
+      ),
+    );
+    await writeFixture(
+      root,
+      "apps/web/src/app/(dashboard)/users/[id]/page.tsx",
+      "export default function Page() { return null; }\n",
+    );
+    await writeFixture(
+      root,
+      "apps/web/src/app/(dashboard)/users/[id]/page.test.tsx",
+      "test('route', () => {});\n",
+    );
+    await writeFixture(
+      root,
+      "apps/web/src/app/api/things/route.ts",
+      "export function GET() { return new Response('ok'); }\n",
+    );
+    await writeFixture(
+      root,
+      "apps/admin/package.json",
+      JSON.stringify({ name: "admin", dependencies: { next: "1.0.0" } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/admin/project.json",
+      JSON.stringify({ name: "admin", targets: { test: {} } }, null, 2),
+    );
+    await writeFixture(
+      root,
+      "apps/admin/src/pages/settings.tsx",
+      "export default function Settings() { return null; }\n",
+    );
+
+    const project = await detectProject(root);
+    const result = await mapFeatures(root, project, []);
+    const titles = result.features.map((feature) => feature.title);
+    const webRoute = result.features.find((feature) => feature.title === "web route /users/:id");
+    const adminRoute = result.features.find((feature) => feature.title === "admin route /settings");
+
+    expect(titles).toContain("web route /users/:id");
+    expect(titles).toContain("web route /api/things");
+    expect(titles).toContain("admin route /settings");
+    expect(webRoute?.entrypoints[0]?.path).toBe("apps/web/src/app/(dashboard)/users/[id]/page.tsx");
+    expect(webRoute?.entrypoints[0]?.route).toBe("/users/:id");
+    expect(webRoute?.tags).toEqual(
+      expect.arrayContaining(["project:web", "project-root:apps/web", "project-type:application"]),
+    );
+    expect(webRoute?.tests).toEqual([
+      {
+        path: "apps/web/src/app/(dashboard)/users/[id]/page.test.tsx",
+        command: "yarn nx test web",
+      },
+    ]);
+    expect(webRoute?.contextFiles).toContainEqual({
+      path: "apps/web/project.json",
+      reason: "project context",
+    });
+    expect(adminRoute?.tests.every((test) => test.command === "yarn nx test admin")).toBe(true);
+  });
+
+  it("maps Next routes inside Nx projects without package manifests", async () => {
+    const root = await fixtureRoot("clawpatch-map-next-nx-no-package-");
+    await writeFixture(root, "package.json", JSON.stringify({ name: "workspace-root" }, null, 2));
+    await writeFixture(root, "pnpm-lock.yaml", "");
+    await writeFixture(
+      root,
+      "apps/portal/project.json",
+      JSON.stringify(
+        {
+          name: "portal",
+          sourceRoot: "apps/portal/src",
+          projectType: "application",
+          targets: { test: {} },
+        },
+        null,
+        2,
+      ),
+    );
+    await writeFixture(
+      root,
+      "apps/portal/src/app/account/page.tsx",
+      "export default function Account() { return null; }\n",
+    );
+    await writeFixture(
+      root,
+      "apps/portal/src/app/account/page.test.tsx",
+      "test('route', () => {});\n",
+    );
+
+    const project = await detectProject(root);
+    const result = await mapFeatures(root, project, []);
+    const route = result.features.find((feature) => feature.title === "portal route /account");
+
+    expect(route?.entrypoints[0]?.path).toBe("apps/portal/src/app/account/page.tsx");
+    expect(route?.tests).toEqual([
+      { path: "apps/portal/src/app/account/page.test.tsx", command: "pnpm nx test portal" },
+    ]);
+    expect(route?.tags).toEqual(
+      expect.arrayContaining([
+        "project:portal",
+        "project-root:apps/portal",
+        "project-type:application",
+      ]),
+    );
+  });
+
   it("does not map src app-shaped routes without a Next project signal", async () => {
     const root = await fixtureRoot("clawpatch-map-src-non-next-");
     await writeFixture(root, "package.json", JSON.stringify({ name: "plain-app" }, null, 2));
