@@ -24,6 +24,12 @@ export function providerByName(name: string): Provider {
   if (name === "codex") {
     return codexProvider;
   }
+  if (name === "claude") {
+    return claudeProvider;
+  }
+  if (name === "pi") {
+    return piProvider;
+  }
   if (name === "mock") {
     return mockProvider;
   }
@@ -52,6 +58,54 @@ const codexProvider: Provider = {
   },
   async revalidate(root: string, prompt: string, model: string | null): Promise<RevalidateOutput> {
     const output = await runCodexJson(root, prompt, model, revalidateJsonSchema);
+    return revalidateOutputSchema.parse(output);
+  },
+};
+
+const claudeProvider: Provider = {
+  name: "claude",
+  async check(root: string): Promise<string> {
+    const result = await runCommandArgs("claude", ["--version"], root);
+    if (result.exitCode !== 0) {
+      throw new ClawpatchError("claude CLI not available", 4, "provider-auth");
+    }
+    return result.stdout.trim();
+  },
+  async review(root: string, prompt: string, model: string | null): Promise<ReviewOutput> {
+    const output = await runClaudeJson(root, prompt, model, reviewJsonSchema, "read-only");
+    return reviewOutputSchema.parse(output);
+  },
+  async fix(root: string, prompt: string, model: string | null): Promise<FixPlanOutput> {
+    const output = await runClaudeJson(root, prompt, model, fixPlanJsonSchema, "workspace-write");
+    return fixPlanOutputSchema.parse(output);
+  },
+  async revalidate(root: string, prompt: string, model: string | null): Promise<RevalidateOutput> {
+    const output = await runClaudeJson(root, prompt, model, revalidateJsonSchema, "read-only");
+    return revalidateOutputSchema.parse(output);
+  },
+};
+
+const piProvider: Provider = {
+  name: "pi",
+  async check(root: string): Promise<string> {
+    const result = await runCommandArgs("pi", ["--version"], root);
+    if (result.exitCode !== 0) {
+      throw new ClawpatchError("pi CLI not available", 4, "provider-auth");
+    }
+    // pi writes --version to stderr; fall back to it when stdout is empty.
+    const version = result.stdout.trim();
+    return version.length > 0 ? version : result.stderr.trim();
+  },
+  async review(root: string, prompt: string, model: string | null): Promise<ReviewOutput> {
+    const output = await runPiJson(root, prompt, model, reviewJsonSchema, "read-only");
+    return reviewOutputSchema.parse(output);
+  },
+  async fix(root: string, prompt: string, model: string | null): Promise<FixPlanOutput> {
+    const output = await runPiJson(root, prompt, model, fixPlanJsonSchema, "workspace-write");
+    return fixPlanOutputSchema.parse(output);
+  },
+  async revalidate(root: string, prompt: string, model: string | null): Promise<RevalidateOutput> {
+    const output = await runPiJson(root, prompt, model, revalidateJsonSchema, "read-only");
     return revalidateOutputSchema.parse(output);
   },
 };
@@ -176,6 +230,254 @@ async function runCodexJson(
     throw new ClawpatchError("codex provider produced no JSON output", 8, "malformed-output");
   }
   return JSON.parse(raw) as unknown;
+}
+
+type Sandbox = "read-only" | "workspace-write";
+
+/**
+ * Build the argv for `claude -p` with structured output.
+ *
+ * Exported for testing: provider command construction is the kind of thing that
+ * silently rots when claude-code changes flags, so it gets a focused test.
+ */
+export function buildClaudeArgs(
+  root: string,
+  schema: object,
+  model: string | null,
+  sandbox: Sandbox,
+): string[] {
+  const args = [
+    "-p",
+    "--output-format",
+    "json",
+    "--json-schema",
+    JSON.stringify(schema),
+    "--add-dir",
+    root,
+  ];
+  if (model !== null) {
+    args.push("--model", model);
+  }
+  if (sandbox === "read-only") {
+    args.push("--allowedTools", "Read Glob Grep");
+  } else {
+    args.push("--dangerously-skip-permissions");
+  }
+  return args;
+}
+
+/**
+ * Parse the envelope returned by `claude -p --output-format json`.
+ *
+ * Shape: { type: "result", is_error: bool, result: string, ... }.
+ * With `--json-schema` the `result` field is a JSON-encoded string conforming
+ * to the schema. We parse the envelope, surface errors, and JSON.parse the
+ * inner payload.
+ */
+export function parseClaudeEnvelope(stdout: string): unknown {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) {
+    throw new ClawpatchError("claude provider produced no output", 8, "malformed-output");
+  }
+  let envelope: { is_error?: boolean; result?: unknown; error?: string };
+  try {
+    envelope = JSON.parse(trimmed) as typeof envelope;
+  } catch {
+    throw new ClawpatchError(
+      `claude provider returned non-JSON envelope: ${trimmed.slice(0, 200)}`,
+      8,
+      "malformed-output",
+    );
+  }
+  if (envelope.is_error === true) {
+    throw new ClawpatchError(
+      `claude provider reported error: ${envelope.error ?? "unknown"}`,
+      1,
+      "provider-failure",
+    );
+  }
+  const result = envelope.result;
+  if (typeof result === "string") {
+    try {
+      return JSON.parse(result) as unknown;
+    } catch {
+      throw new ClawpatchError(
+        `claude provider result is not valid JSON: ${result.slice(0, 200)}`,
+        8,
+        "malformed-output",
+      );
+    }
+  }
+  if (result === null || result === undefined) {
+    throw new ClawpatchError("claude provider envelope missing result", 8, "malformed-output");
+  }
+  return result;
+}
+
+async function runClaudeJson(
+  root: string,
+  prompt: string,
+  model: string | null,
+  schema: object,
+  sandbox: Sandbox,
+): Promise<unknown> {
+  const args = buildClaudeArgs(root, schema, model, sandbox);
+  const result = await runCommandArgs("claude", args, root, prompt);
+  if (result.exitCode !== 0) {
+    throw new ClawpatchError(
+      `claude provider failed: ${result.stderr || result.stdout}`,
+      providerExitCode(result.stderr),
+      "provider-failure",
+    );
+  }
+  return parseClaudeEnvelope(result.stdout);
+}
+
+/**
+ * Build the argv for `pi -p` with JSON output mode.
+ *
+ * Pi has no `--json-schema` equivalent, so we constrain tools and inline the
+ * schema in the prompt instead (see `wrapPiPrompt`).
+ */
+export function buildPiArgs(model: string | null, sandbox: Sandbox): string[] {
+  const args = ["-p", "--mode", "json", "--no-session"];
+  if (model !== null) {
+    args.push("--model", model);
+  }
+  if (sandbox === "read-only") {
+    args.push("-t", "read,glob,grep");
+  }
+  return args;
+}
+
+/**
+ * Wrap a prompt with a strict instruction to emit only JSON matching the
+ * schema. Pi has no native schema enforcement; this prompt + Zod validation
+ * downstream is the safety net.
+ */
+export function wrapPiPrompt(prompt: string, schema: object): string {
+  return `${prompt}\n\n---\nRespond with ONLY a single JSON object matching this JSON Schema. No prose, no markdown fences, no commentary.\n\nSchema:\n${JSON.stringify(schema)}`;
+}
+
+/**
+ * Extract the JSON payload from pi's `--mode json` output. Pi streams one
+ * JSON event per line; the final assistant message is the payload we want.
+ * If parsing the whole stdout as a single JSON object works, prefer that.
+ */
+export function parsePiEnvelope(stdout: string): unknown {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) {
+    throw new ClawpatchError("pi provider produced no output", 8, "malformed-output");
+  }
+  const candidate = extractPiAssistantText(trimmed);
+  const stripped = stripFences(candidate).trim();
+  try {
+    return JSON.parse(stripped) as unknown;
+  } catch {
+    throw new ClawpatchError(
+      `pi provider returned non-JSON payload: ${stripped.slice(0, 200)}`,
+      8,
+      "malformed-output",
+    );
+  }
+}
+
+function extractPiAssistantText(stdout: string): string {
+  // Try whole stdout first — pi may emit one envelope total.
+  const single = tryParseJson(stdout);
+  if (single !== undefined) {
+    return assistantTextFromObject(single) ?? stdout;
+  }
+  // Otherwise scan lines bottom-up for the last assistant text.
+  const lines = stdout.split(/\r?\n/u).filter((line) => line.trim().length > 0);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const parsed = tryParseJson(lines[index]!);
+    if (parsed === undefined) {
+      continue;
+    }
+    const text = assistantTextFromObject(parsed);
+    if (text !== null && text !== undefined && text.length > 0) {
+      return text;
+    }
+  }
+  return stdout;
+}
+
+function assistantTextFromObject(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record["text"] === "string") {
+    return record["text"] as string;
+  }
+  if (typeof record["content"] === "string") {
+    return record["content"] as string;
+  }
+  if (typeof record["result"] === "string") {
+    return record["result"] as string;
+  }
+  if (typeof record["message"] === "string") {
+    return record["message"] as string;
+  }
+  if (Array.isArray(record["content"])) {
+    const parts = record["content"] as unknown[];
+    const joined = parts
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        if (typeof part === "object" && part !== null) {
+          const partRecord = part as Record<string, unknown>;
+          if (typeof partRecord["text"] === "string") {
+            return partRecord["text"] as string;
+          }
+        }
+        return "";
+      })
+      .filter((piece) => piece.length > 0)
+      .join("");
+    if (joined.length > 0) {
+      return joined;
+    }
+  }
+  return null;
+}
+
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function stripFences(value: string): string {
+  const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(value.trim());
+  if (fence !== null && fence[1] !== undefined) {
+    return fence[1];
+  }
+  return value;
+}
+
+async function runPiJson(
+  root: string,
+  prompt: string,
+  model: string | null,
+  schema: object,
+  sandbox: Sandbox,
+): Promise<unknown> {
+  const args = buildPiArgs(model, sandbox);
+  const wrapped = wrapPiPrompt(prompt, schema);
+  const result = await runCommandArgs("pi", args, root, wrapped);
+  if (result.exitCode !== 0) {
+    throw new ClawpatchError(
+      `pi provider failed: ${result.stderr || result.stdout}`,
+      providerExitCode(result.stderr),
+      "provider-failure",
+    );
+  }
+  return parsePiEnvelope(result.stdout);
 }
 
 function providerExitCode(stderr: string): number {
