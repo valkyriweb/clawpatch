@@ -143,6 +143,21 @@ describe("parsePiEnvelope", () => {
     expect(parsePiEnvelope(events)).toEqual({ ok: true });
   });
 
+  it("extracts the nested assistant message from Pi v3 events", () => {
+    const events = [
+      JSON.stringify({ type: "session", version: 3 }),
+      JSON.stringify({ type: "message_end", message: { role: "user", content: [] } }),
+      JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: JSON.stringify({ ok: true }) }],
+        },
+      }),
+    ].join("\n");
+    expect(parsePiEnvelope(events)).toEqual({ ok: true });
+  });
+
   it("strips ```json fences", () => {
     const event = JSON.stringify({
       role: "assistant",

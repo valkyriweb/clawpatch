@@ -420,6 +420,12 @@ function assistantTextFromObject(value: unknown): string | null {
   if (typeof record["message"] === "string") {
     return record["message"] as string;
   }
+  if (typeof record["message"] === "object" && record["message"] !== null) {
+    const message = record["message"] as Record<string, unknown>;
+    if (message["role"] === "assistant") {
+      return assistantTextFromObject(message);
+    }
+  }
   if (Array.isArray(record["content"])) {
     const parts = record["content"] as unknown[];
     const joined = parts
