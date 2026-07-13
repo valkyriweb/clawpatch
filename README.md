@@ -100,12 +100,13 @@ CLAWPATCH_PROVIDER=pi clawpatch review --model anthropic/claude-sonnet-4-5
 
 Provider-specific notes:
 
-- **claude**: uses `--json-schema` for structured output. Review/revalidate
-  restrict tools to `Read Glob Grep`; fix uses `--dangerously-skip-permissions`
-  so the agent can edit the worktree.
+- **claude**: uses `--json-schema` for structured output and `--safe-mode` to
+  disable inherited customizations. Review/revalidate restrict tools to
+  `Read,Glob,Grep`; fix adds `Edit,Write` under `acceptEdits`, which permits
+  edits inside the working directory while retaining outside-path checks.
 - **pi**: no native schema enforcement; the JSON Schema is inlined in the
   prompt and validated by Zod after parsing. Review/revalidate restrict tools
-  to `read,glob,grep`; fix runs with default tools.
+  to `read,grep,find,ls`; fix runs with default tools.
 
 ## Commands
 

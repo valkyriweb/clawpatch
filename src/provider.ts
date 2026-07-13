@@ -248,6 +248,7 @@ export function buildClaudeArgs(
 ): string[] {
   const args = [
     "-p",
+    "--safe-mode",
     "--output-format",
     "json",
     "--json-schema",
@@ -259,9 +260,9 @@ export function buildClaudeArgs(
     args.push("--model", model);
   }
   if (sandbox === "read-only") {
-    args.push("--allowedTools", "Read Glob Grep");
+    args.push("--tools", "Read,Glob,Grep");
   } else {
-    args.push("--dangerously-skip-permissions");
+    args.push("--tools", "Read,Glob,Grep,Edit,Write", "--permission-mode", "acceptEdits");
   }
   return args;
 }
@@ -269,17 +270,16 @@ export function buildClaudeArgs(
 /**
  * Parse the envelope returned by `claude -p --output-format json`.
  *
- * Shape: { type: "result", is_error: bool, result: string, ... }.
- * With `--json-schema` the `result` field is a JSON-encoded string conforming
- * to the schema. We parse the envelope, surface errors, and JSON.parse the
- * inner payload.
+ * Shape: { type: "result", is_error: bool, structured_output: unknown, ... }.
+ * With `--json-schema`, Claude Code returns the schema-validated value in
+ * `structured_output`; `result` remains ordinary assistant text.
  */
 export function parseClaudeEnvelope(stdout: string): unknown {
   const trimmed = stdout.trim();
   if (trimmed.length === 0) {
     throw new ClawpatchError("claude provider produced no output", 8, "malformed-output");
   }
-  let envelope: { is_error?: boolean; result?: unknown; error?: string };
+  let envelope: { is_error?: boolean; structured_output?: unknown; error?: string };
   try {
     envelope = JSON.parse(trimmed) as typeof envelope;
   } catch {
@@ -296,22 +296,14 @@ export function parseClaudeEnvelope(stdout: string): unknown {
       "provider-failure",
     );
   }
-  const result = envelope.result;
-  if (typeof result === "string") {
-    try {
-      return JSON.parse(result) as unknown;
-    } catch {
-      throw new ClawpatchError(
-        `claude provider result is not valid JSON: ${result.slice(0, 200)}`,
-        8,
-        "malformed-output",
-      );
-    }
+  if (!Object.hasOwn(envelope, "structured_output")) {
+    throw new ClawpatchError(
+      "claude provider envelope missing structured_output",
+      8,
+      "malformed-output",
+    );
   }
-  if (result === null || result === undefined) {
-    throw new ClawpatchError("claude provider envelope missing result", 8, "malformed-output");
-  }
-  return result;
+  return envelope.structured_output;
 }
 
 async function runClaudeJson(
@@ -345,7 +337,7 @@ export function buildPiArgs(model: string | null, sandbox: Sandbox): string[] {
     args.push("--model", model);
   }
   if (sandbox === "read-only") {
-    args.push("-t", "read,glob,grep");
+    args.push("-t", "read,grep,find,ls");
   }
   return args;
 }

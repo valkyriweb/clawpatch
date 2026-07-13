@@ -45,34 +45,33 @@ describe("buildClaudeArgs", () => {
     expect(args).toContain("/repo");
     expect(args).toContain("--model");
     expect(args).toContain("sonnet");
-    expect(args).toContain("--allowedTools");
-    expect(args).toContain("Read Glob Grep");
+    expect(args).toContain("--safe-mode");
+    expect(args).toContain("--tools");
+    expect(args).toContain("Read,Glob,Grep");
+    expect(args).not.toContain("--allowedTools");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });
 
-  it("constructs workspace-write invocation without model", () => {
+  it("constructs workspace-confined edit invocation without model", () => {
     const args = buildClaudeArgs("/repo", schema, null, "workspace-write");
-    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--safe-mode");
+    expect(args).toContain("--tools");
+    expect(args).toContain("Read,Glob,Grep,Edit,Write");
+    expect(args).toContain("--permission-mode");
+    expect(args).toContain("acceptEdits");
+    expect(args).not.toContain("--dangerously-skip-permissions");
     expect(args).not.toContain("--allowedTools");
     expect(args).not.toContain("--model");
   });
 });
 
 describe("parseClaudeEnvelope", () => {
-  it("extracts JSON-encoded result string", () => {
+  it("extracts the validated structured output", () => {
     const envelope = JSON.stringify({
       type: "result",
       is_error: false,
-      result: JSON.stringify({ ok: true }),
-    });
-    expect(parseClaudeEnvelope(envelope)).toEqual({ ok: true });
-  });
-
-  it("accepts object result", () => {
-    const envelope = JSON.stringify({
-      type: "result",
-      is_error: false,
-      result: { ok: true },
+      result: "ordinary assistant text",
+      structured_output: { ok: true },
     });
     expect(parseClaudeEnvelope(envelope)).toEqual({ ok: true });
   });
@@ -90,9 +89,9 @@ describe("parseClaudeEnvelope", () => {
     expect(() => parseClaudeEnvelope(envelope)).toThrow(/boom/u);
   });
 
-  it("throws when inner result is not valid JSON", () => {
-    const envelope = JSON.stringify({ is_error: false, result: "not json" });
-    expect(() => parseClaudeEnvelope(envelope)).toThrow(/not valid JSON/u);
+  it("throws when structured output is missing", () => {
+    const envelope = JSON.stringify({ is_error: false, result: "ordinary assistant text" });
+    expect(() => parseClaudeEnvelope(envelope)).toThrow(/missing structured_output/u);
   });
 });
 
@@ -106,7 +105,7 @@ describe("buildPiArgs", () => {
     expect(args).toContain("--model");
     expect(args).toContain("anthropic/sonnet");
     expect(args).toContain("-t");
-    expect(args).toContain("read,glob,grep");
+    expect(args).toContain("read,grep,find,ls");
   });
 
   it("constructs workspace-write invocation without tool restriction", () => {
