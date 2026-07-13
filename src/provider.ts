@@ -322,7 +322,7 @@ async function runClaudeJson(
   sandbox: Sandbox,
 ): Promise<unknown> {
   const args = buildClaudeArgs(root, schema, model, sandbox);
-  const result = await runCommandArgs("claude", args, root, prompt);
+  const result = await runCommandArgs("claude", args, root, prompt, { trimOutput: false });
   if (result.exitCode !== 0) {
     throw new ClawpatchError(
       `claude provider failed: ${result.stderr || result.stdout}`,
@@ -475,7 +475,7 @@ async function runPiJson(
 ): Promise<unknown> {
   const args = buildPiArgs(model, sandbox);
   const wrapped = wrapPiPrompt(prompt, schema);
-  const result = await runCommandArgs("pi", args, root, wrapped);
+  const result = await runCommandArgs("pi", args, root, wrapped, { trimOutput: false });
   if (result.exitCode !== 0) {
     throw new ClawpatchError(
       `pi provider failed: ${result.stderr || result.stdout}`,
