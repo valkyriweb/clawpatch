@@ -69,24 +69,44 @@ Deeper framework mappers and agent-assisted enrichment are next steps.
 
 ## Provider
 
-The default provider is the local Codex CLI.
+The default provider is the local Codex CLI. Claude Code and Pi are also
+supported.
 
 ```bash
 codex --version
 clawpatch doctor
 ```
 
-Provider calls use `codex exec` with strict JSON schemas. Review and revalidate
-run read-only; fix planning runs with workspace-write because Codex may edit the
-working tree during the explicit fix command.
+Provider calls use the local CLI with strict JSON schemas. Review and
+revalidate run read-only; fix planning runs with workspace-write because the
+agent may edit the working tree during the explicit fix command.
 
 Supported provider names today:
 
-- `codex`: local Codex CLI
+- `codex`: local Codex CLI (`codex exec --output-schema`)
+- `claude`: local Claude Code CLI (`claude -p --json-schema`)
+- `pi`: local Pi coding agent (`pi -p --mode json`, schema inlined in prompt)
 - `mock`: deterministic test provider
 - `mock-fail`: failure test provider
 
-Direct OpenAI, Claude, Gemini, and provider panels are not implemented yet.
+Select a provider per call with `--provider <name>` or persistently via
+`.clawpatch/config.json` / `CLAWPATCH_PROVIDER=<name>`. Pick a model with
+`--model <name>` or `CLAWPATCH_MODEL=<name>`.
+
+```bash
+clawpatch review --provider claude --model sonnet
+CLAWPATCH_PROVIDER=pi clawpatch review --model anthropic/claude-sonnet-4-5
+```
+
+Provider-specific notes:
+
+- **claude**: uses `--json-schema` for structured output and `--safe-mode` to
+  disable inherited customizations. Review/revalidate restrict tools to
+  `Read,Glob,Grep`; fix adds `Edit,Write` under `acceptEdits`, which permits
+  edits inside the working directory while retaining outside-path checks.
+- **pi**: no native schema enforcement; the JSON Schema is inlined in the
+  prompt and validated by Zod after parsing. Review/revalidate restrict tools
+  to `read,grep,find,ls`; fix runs with default tools.
 
 ## Commands
 

@@ -31,6 +31,18 @@ describe("runCommandArgs", () => {
     expect(result.stderr).toContain("clawpatch-missing-executable-for-test");
   });
 
+  it("can preserve provider output larger than the diagnostic trim limit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "clawpatch-exec-"));
+    const script = join(dir, "print-large-output.mjs");
+    await writeFile(script, 'process.stdout.write("x".repeat(9000));', "utf8");
+
+    const result = await runCommandArgs(process.execPath, [script], dir, undefined, {
+      trimOutput: false,
+    });
+
+    expect(result.stdout).toHaveLength(9000);
+  });
+
   it.runIf(process.platform === "win32")("runs cmd shims with escaped arguments", async () => {
     const dir = await mkdtemp(join(tmpdir(), "clawpatch-exec-"));
     const script = join(dir, "print-args.mjs");
