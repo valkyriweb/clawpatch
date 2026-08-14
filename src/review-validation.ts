@@ -1,0 +1,271 @@
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+import { ClawpatchError } from "./errors.js";
+import { REVIEW_PROMPT_FILE_CHAR_LIMIT, type ReviewPromptManifest } from "./prompt.js";
+import type { DroppedFinding } from "./provider-types.js";
+import { providerSample } from "./provider-sample.js";
+import {
+  evaluateFindingForDrop,
+  type RegistryVerdict,
+  type RegistryVerifierOptions,
+} from "./registry-verifier.js";
+import { ReviewOutput } from "./types.js";
+
+/**
+ * Optional post-validation hook: receives a finding that has already
+ * passed schema and evidence checks, returns a drop reason if the
+ * finding's central claim is independently refuted, or null to keep it.
+ *
+ * The default implementation, when enabled by config, runs the npm
+ * registry verifier — see `src/registry-verifier.ts`. Callers may inject
+ * a stub for testing or provide a different verifier (e.g. PyPI) without
+ * touching the partitioning logic here.
+ */
+export type FindingPostValidator = (
+  finding: ReviewOutput["findings"][number],
+) => Promise<{ dropReason: string } | null>;
+
+export type ValidatePartitionedOptions = {
+  /**
+   * Optional post-validation hook applied to findings that have already
+   * passed schema + evidence validation. Findings the hook returns a
+   * drop reason for are partitioned into `droppedFindings` with
+   * `layer: "registry-verifier"` instead of being kept.
+   */
+  postValidator?: FindingPostValidator;
+};
+
+/**
+ * Runs evidence validation per finding and partitions failures instead
+ * of throwing on the first bad finding. Callers receive only the validated findings plus a list
+ * of {@link DroppedFinding}s describing why each rejection occurred. The
+ * caller is then free to surface drops as non-fatal run errors instead
+ * of losing the whole feature.
+ */
+export async function validateReviewOutputPartitioned(
+  root: string,
+  manifest: ReviewPromptManifest,
+  output: ReviewOutput,
+  options: ValidatePartitionedOptions = {},
+): Promise<{ findings: ReviewOutput["findings"]; droppedFindings: DroppedFinding[] }> {
+  const included = includedReviewPaths(manifest);
+  const promptFiles = new Map(
+    manifest.includedFiles.map((file) => [normalizePath(file.path), file]),
+  );
+  const cache = new Map<string, Promise<string>>();
+  const validFindings: ReviewOutput["findings"] = [];
+  const droppedFindings: DroppedFinding[] = [];
+  for (let idx = 0; idx < output.findings.length; idx += 1) {
+    const finding = output.findings[idx]!;
+    try {
+      await validateFinding(root, finding, included, promptFiles, cache);
+    } catch (error: unknown) {
+      if (error instanceof ClawpatchError && error.code === "malformed-output") {
+        droppedFindings.push({
+          path: ["findings", idx],
+          message: error.message.replace(/^malformed provider review output:\s*/u, ""),
+          sample: providerSample(finding),
+          layer: "validation",
+        });
+        continue;
+      }
+      throw error;
+    }
+    if (options.postValidator) {
+      const verdict = await options.postValidator(finding);
+      if (verdict) {
+        droppedFindings.push({
+          path: ["findings", idx],
+          message: verdict.dropReason,
+          sample: providerSample(finding),
+          layer: "registry-verifier",
+        });
+        continue;
+      }
+    }
+    validFindings.push(finding);
+  }
+  return { findings: validFindings, droppedFindings };
+}
+
+/**
+ * Build a `FindingPostValidator` that runs the npm registry verifier
+ * with a shared per-call cache. Returned validator returns a drop
+ * decision when the finding's "X@Y is unpublished" claim is contradicted
+ * by the registry, or null to keep the finding.
+ *
+ * `verifierOptions` lets callers inject a stub fetch (testing) or
+ * override the registry base URL (corporate mirror). The cache is
+ * managed internally so concurrent finding validations within one call
+ * deduplicate identical registry lookups.
+ */
+export function buildRegistryVerifierValidator(
+  verifierOptions: RegistryVerifierOptions = {},
+): FindingPostValidator {
+  const cache = verifierOptions.cache ?? new Map<string, Promise<RegistryVerdict>>();
+  const merged: RegistryVerifierOptions = { ...verifierOptions, cache };
+  return async (finding) => evaluateFindingForDrop(finding, merged);
+}
+
+async function validateFinding(
+  root: string,
+  finding: ReviewOutput["findings"][number],
+  included: ReadonlySet<string>,
+  promptFiles: Map<string, ReviewPromptManifest["includedFiles"][number]>,
+  cache: Map<string, Promise<string>>,
+): Promise<void> {
+  if (finding.evidence.length === 0) {
+    throwMalformed(`finding "${finding.title}" has no evidence`);
+  }
+  for (const evidence of finding.evidence) {
+    assertIncludedPath(evidence.path, included, "evidence file");
+    const promptFile = promptFiles.get(normalizePath(evidence.path));
+    if (promptFile === undefined || !promptFile.readable) {
+      throwMalformed(`evidence file was not readable in review context: ${evidence.path}`);
+    }
+    const contents = await fileContents(root, evidence.path, promptFile.truncated, cache);
+    assertVerifiableEvidence(evidence);
+    assertLineRange(contents, evidence, promptFile);
+    assertQuote(contents, evidence);
+  }
+}
+
+function includedReviewPaths(manifest: ReviewPromptManifest): Set<string> {
+  return new Set(manifest.includedFiles.map((file) => normalizePath(file.path)));
+}
+
+function assertIncludedPath(path: string, included: ReadonlySet<string>, label: string): void {
+  const normalized = normalizePath(path);
+  assertSafePath(path, label);
+  if (!included.has(normalized)) {
+    throwMalformed(`${label} was not included in review context: ${path}`);
+  }
+}
+
+function assertVerifiableEvidence(
+  evidence: ReviewOutput["findings"][number]["evidence"][number],
+): void {
+  const hasLineRange = evidence.startLine !== null || evidence.endLine !== null;
+  const hasQuote = evidence.quote !== null && evidence.quote.trim().length > 0;
+  if (!hasLineRange && !hasQuote) {
+    throwMalformed(`evidence must include a line range or quote: ${evidence.path}`);
+  }
+}
+
+function assertSafePath(path: string, label: string): void {
+  const normalized = normalizePath(path);
+  if (normalized.startsWith("../") || isAbsolute(normalized)) {
+    throwMalformed(`${label} escapes repository root: ${path}`);
+  }
+}
+
+async function fileContents(
+  root: string,
+  path: string,
+  truncated: boolean,
+  cache: Map<string, Promise<string>>,
+): Promise<string> {
+  const normalized = normalizePath(path);
+  const key = `${normalized}\0${truncated ? "truncated" : "full"}`;
+  const existing = cache.get(key);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const loaded = readIncludedFile(root, normalized, truncated);
+  cache.set(key, loaded);
+  return loaded;
+}
+
+async function readIncludedFile(root: string, path: string, truncated: boolean): Promise<string> {
+  const full = resolve(root, path);
+  const realRoot = await realpath(root).catch(() => root);
+  const realFull = await realpath(full).catch(() => null);
+  if (realFull === null || !isInside(realRoot, realFull)) {
+    throwMalformed(`evidence file is not readable inside repository: ${path}`);
+  }
+  const contents = await readFile(full, "utf8").catch(() => {
+    throwMalformed(`evidence file is not readable inside repository: ${path}`);
+  });
+  return truncated ? contents.slice(0, REVIEW_PROMPT_FILE_CHAR_LIMIT) : contents;
+}
+
+function assertLineRange(
+  contents: string,
+  evidence: ReviewOutput["findings"][number]["evidence"][number],
+  promptFile: ReviewPromptManifest["includedFiles"][number],
+): void {
+  const { startLine, endLine } = evidence;
+  if (startLine === null && endLine === null) {
+    return;
+  }
+  if (startLine === null || endLine === null) {
+    throwMalformed(`evidence line range must include both startLine and endLine: ${evidence.path}`);
+  }
+  if (startLine > endLine) {
+    throwMalformed(`evidence line range is inverted: ${evidence.path}:${startLine}-${endLine}`);
+  }
+  const lineCount = reviewLineCount(contents);
+  if (endLine > lineCount) {
+    throwMalformed(
+      `evidence line range exceeds file length: ${evidence.path}:${startLine}-${endLine}`,
+    );
+  }
+  if (!rangeIncluded(startLine, endLine, promptFile.includedLineRanges)) {
+    throwMalformed(
+      `evidence line range was not included in review context: ${evidence.path}:${startLine}-${endLine}`,
+    );
+  }
+}
+
+function rangeIncluded(
+  startLine: number,
+  endLine: number,
+  ranges: readonly { startLine: number; endLine: number }[],
+): boolean {
+  return ranges.some((range) => startLine >= range.startLine && endLine <= range.endLine);
+}
+
+function reviewLineCount(contents: string): number {
+  if (contents.length === 0) {
+    return 1;
+  }
+  const lines = contents.split("\n").length;
+  return contents.endsWith("\n") ? lines - 1 : lines;
+}
+
+function assertQuote(
+  contents: string,
+  evidence: ReviewOutput["findings"][number]["evidence"][number],
+): void {
+  const quote = evidence.quote;
+  if (quote === null || quote.trim().length === 0) {
+    return;
+  }
+  const target =
+    evidence.startLine !== null && evidence.endLine !== null
+      ? contents
+          .split("\n")
+          .slice(evidence.startLine - 1, evidence.endLine)
+          .join("\n")
+      : contents;
+  if (!target.includes(quote) && !compactWhitespace(target).includes(compactWhitespace(quote))) {
+    throwMalformed(`evidence quote does not match file contents: ${evidence.path}`);
+  }
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/gu, "/").replace(/^\.\/+/u, "");
+}
+
+function compactWhitespace(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+function throwMalformed(message: string): never {
+  throw new ClawpatchError(`malformed provider review output: ${message}`, 8, "malformed-output");
+}
