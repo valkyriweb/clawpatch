@@ -313,6 +313,21 @@ How the pi provider works:
 - Timeout: 180 seconds by default, override with `CLAWPATCH_PI_TIMEOUT_MS` or
   `CLAWPATCH_PROVIDER_TIMEOUT_MS`
 
+Extension allowlist:
+
+```bash
+CLAWPATCH_PI_EXTENSIONS=/path/to/extension/index.ts clawpatch review --provider pi
+```
+
+`--no-extensions` disables discovery, but explicit `-e` paths still load. Some
+pi providers are only reachable through an extension: the model resolves from
+the catalogue, which is config and survives isolation, while the code
+registering its provider does not, so the run fails on a detail the catalogue
+appears to have covered. Name those extensions here, comma-separated, and they
+load by absolute path while discovery stays off. This is environment-only, so a
+reviewed checkout cannot name its own extension the way it could through a
+repository config file.
+
 Permission caveat: pi's `--tools read` restricts the agent to the read tool for
 review and revalidate, but enforcement depends on pi honoring the tool allowlist.
 For write operations during `fix`, the agent has full filesystem and shell access.

@@ -83,6 +83,7 @@ async function runPiJson(
       "--no-extensions",
       "--no-prompt-templates",
       "--no-themes",
+      ...piExtensionArgs(),
       `@${promptPath}`,
       "Follow the attached clawpatch prompt. Return only the requested JSON object.",
     ];
@@ -152,4 +153,22 @@ function piTimeoutMs(): number {
   return providerTimeoutMs("CLAWPATCH_PI_TIMEOUT_MS", PI_DEFAULT_TIMEOUT_MS);
 }
 
-export const piTesting = { piThinkingLevel };
+// --no-extensions disables discovery, but explicit -e paths still load. That
+// distinction matters for providers that pi can only reach through an
+// extension: a model may resolve from the catalogue (config, which survives
+// isolation) while the code registering its provider does not, and the run
+// fails on a detail the catalogue appears to have covered.
+//
+// Deliberately env-only. Discovery stays off, so a reviewed checkout cannot
+// name its own extension the way it could through a repository config file.
+export function piExtensionArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env["CLAWPATCH_PI_EXTENSIONS"];
+  if (raw === undefined) return [];
+  return raw
+    .split(",")
+    .map((path) => path.trim())
+    .filter((path) => path.length > 0)
+    .flatMap((path) => ["-e", path]);
+}
+
+export const piTesting = { piThinkingLevel, piExtensionArgs };

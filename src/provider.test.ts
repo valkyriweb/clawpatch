@@ -41,6 +41,7 @@ const {
   parseCodexJson,
   parseSemver,
   piThinkingLevel,
+  piExtensionArgs,
   providerExitCode,
   providerJsonSchema,
 } = __testing;
@@ -412,6 +413,28 @@ describe("providerJsonSchema", () => {
     }
     expect(finding["required"]).toContain("reproduction");
     expect(finding["required"]).toContain("minimumFixScope");
+  });
+});
+
+describe("piExtensionArgs", () => {
+  it("loads nothing when the environment names no extension", () => {
+    expect(piExtensionArgs({})).toEqual([]);
+  });
+
+  it("allowlists each named extension past --no-extensions discovery", () => {
+    expect(piExtensionArgs({ CLAWPATCH_PI_EXTENSIONS: "/a/index.ts,/b/index.ts" })).toEqual([
+      "-e",
+      "/a/index.ts",
+      "-e",
+      "/b/index.ts",
+    ]);
+  });
+
+  it("ignores empty entries and surrounding whitespace", () => {
+    expect(piExtensionArgs({ CLAWPATCH_PI_EXTENSIONS: " /a/index.ts , ,, " })).toEqual([
+      "-e",
+      "/a/index.ts",
+    ]);
   });
 });
 
