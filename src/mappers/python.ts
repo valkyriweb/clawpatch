@@ -1,9 +1,12 @@
 import { readFile, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { pathExists } from "../fs.js";
+import { shellQuotePath } from "../shell.js";
+import { partitionFileGroups } from "./grouping.js";
 import {
   isSafeDirectory,
   isSafeFile,
+  normalize,
   packageKind,
   packageTrustBoundaries,
   pathMatchesPrefix,
@@ -11,6 +14,7 @@ import {
   walk,
 } from "./shared.js";
 import { FeatureSeed, SeedFileRef, SeedTestRef } from "./types.js";
+import type { FileGroup } from "./grouping.js";
 
 type PythonScript = {
   name: string;
@@ -32,15 +36,21 @@ type FastApiRoute = {
   methods: string[];
 };
 
-type SourceGroup = {
-  label: string;
-  files: string[];
+type DjangoRoute = {
+  filePath: string;
+  routePath: string;
+  symbol: string | null;
+  include: boolean;
 };
 
 type PyprojectInfo = {
   name: string | null;
   scripts: PythonScript[];
   hasPytest: boolean;
+};
+
+type PythonSeedOptions = {
+  testCommandOverride?: string | null;
 };
 
 const sourceRoots = ["src", "app", "apps", "lib", "scripts", "web"] as const;
@@ -54,7 +64,7 @@ const fastApiRouteDecoratorStartPattern = new RegExp(
   "u",
 );
 const fastApiRouteDecoratorPattern = new RegExp(
-  `^\\s*@${fastApiRouteTargetPattern}\\.(${fastApiRouteMethods})\\((.*)\\)\\s*(?:#.*)?$`,
+  `^\\s*@(${fastApiRouteTargetPattern})\\.(${fastApiRouteMethods})\\((.*)\\)\\s*(?:#.*)?$`,
   "u",
 );
 const projectMetadataFiles = [
@@ -62,6 +72,14 @@ const projectMetadataFiles = [
   "setup.py",
   "setup.cfg",
   "requirements.txt",
+] as const;
+const runtimeMetadataFiles = [
+  "pyproject.toml",
+  "setup.py",
+  "setup.cfg",
+  ".python-version",
+  "runtime.txt",
+  ".tool-versions",
 ] as const;
 const sourceGroupMaxOwnedFiles = 12;
 const sourceGroupMaxTests = 8;
@@ -74,12 +92,33 @@ const flaskRootEntryFiles = [
 ] as const;
 
 export async function pythonSeeds(root: string): Promise<FeatureSeed[]> {
+  const uvMembers = await uvWorkspaceMemberDirs(root);
+  const seeds = filterRootSeedsUnderUvMembers(await pythonProjectSeeds(root), uvMembers);
+  for (const member of uvMembers) {
+    const memberSeeds = await pythonProjectSeeds(join(root, member), {
+      testCommandOverride: uvWorkspaceMemberTestCommand(member),
+    });
+    for (const seed of memberSeeds) {
+      seeds.push(await workspaceMemberSeed(root, seed, member));
+    }
+  }
+  return seeds;
+}
+
+function uvWorkspaceMemberTestCommand(member: string): string {
+  return `uv run --directory ${shellQuotePath(member)} pytest`;
+}
+
+async function pythonProjectSeeds(
+  root: string,
+  options: PythonSeedOptions = {},
+): Promise<FeatureSeed[]> {
   if (!(await isPythonProject(root))) {
     return [];
   }
   const metadata = await readPythonProjectMetadata(root);
   const metadataFiles = await pythonMetadataFiles(root);
-  const testCommand = await pythonTestCommand(root, metadata);
+  const testCommand = options.testCommandOverride ?? (await pythonTestCommand(root, metadata));
   const testFiles = await pythonTestFiles(root);
   const seeds: FeatureSeed[] = [];
 
@@ -125,7 +164,10 @@ export async function pythonSeeds(root: string): Promise<FeatureSeed[]> {
         resolved.entryPath === script.metadataPath
           ? [{ path: script.metadataPath, reason: "console script metadata" }]
           : [{ path: resolved.entryPath, reason: "console script source" }],
-      contextFiles: tests.map((test) => ({ path: test.path, reason: "associated test" })),
+      contextFiles: [
+        ...(await pythonRuntimeContextFiles(root, [resolved.entryPath])),
+        ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+      ],
       tests,
       tags: ["python", "cli"],
       trustBoundaries: ["user-input", "filesystem", "process-exec"],
@@ -139,6 +181,10 @@ export async function pythonSeeds(root: string): Promise<FeatureSeed[]> {
   }
 
   for (const route of await fastApiRouteSeeds(root, testFiles, testCommand)) {
+    seeds.push(route);
+  }
+
+  for (const route of await djangoRouteSeeds(root, testFiles, testCommand)) {
     seeds.push(route);
   }
 
@@ -158,7 +204,10 @@ export async function pythonSeeds(root: string): Promise<FeatureSeed[]> {
       route: null,
       command: null,
       ownedFiles: group.files.map((path) => ({ path, reason: `source group ${group.label}` })),
-      contextFiles: tests.map((test) => ({ path: test.path, reason: "associated test" })),
+      contextFiles: [
+        ...(await pythonRuntimeContextFiles(root, group.files)),
+        ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+      ],
       tests,
       tags: ["python", "source-group"],
       trustBoundaries: packageTrustBoundaries(group.label),
@@ -167,11 +216,373 @@ export async function pythonSeeds(root: string): Promise<FeatureSeed[]> {
     });
   }
 
-  for (const test of standaloneTestSuites(testFiles, testCommand)) {
+  for (const test of await standaloneTestSuites(root, testFiles, testCommand)) {
     seeds.push(test);
   }
 
   return seeds;
+}
+
+function filterRootSeedsUnderUvMembers(
+  seeds: FeatureSeed[],
+  members: readonly string[],
+): FeatureSeed[] {
+  if (members.length === 0) {
+    return seeds;
+  }
+  const filtered: FeatureSeed[] = [];
+  for (const seed of seeds) {
+    if (!seedTouchesUvMember(seed, members)) {
+      filtered.push(seed);
+      continue;
+    }
+    const pruned = pruneRootSeedUvMemberPaths(seed, members);
+    if (pruned !== null) {
+      filtered.push(pruned);
+    }
+  }
+  return filtered;
+}
+
+function seedTouchesUvMember(seed: FeatureSeed, members: readonly string[]): boolean {
+  return seedRepoPaths(seed).some((path) =>
+    members.some((member) => pathMatchesPrefix(path, member)),
+  );
+}
+
+function pruneRootSeedUvMemberPaths(
+  seed: FeatureSeed,
+  members: readonly string[],
+): FeatureSeed | null {
+  if (
+    (seed.source !== "python-source-group" && seed.source !== "python-test-suite") ||
+    seed.ownedFiles === undefined
+  ) {
+    if (seedOwnedOrEntryTouchesUvMember(seed, members)) {
+      return null;
+    }
+    return pruneSeedUvMemberReferences(seed, members);
+  }
+  const ownedFiles = seed.ownedFiles.filter((file) => !pathTouchesUvMember(file.path, members));
+  if (ownedFiles.length === 0) {
+    return null;
+  }
+  const prunedTestEntryPath =
+    seed.source === "python-test-suite" && pathTouchesUvMember(seed.entryPath, members)
+      ? "."
+      : seed.entryPath;
+  const prunedTestTitle =
+    prunedTestEntryPath === "."
+      ? "Python test suite root"
+      : `Python test suite ${prunedTestEntryPath}`;
+  const pruned: FeatureSeed = {
+    ...seed,
+    title: seed.source === "python-test-suite" ? prunedTestTitle : seed.title,
+    entryPath: prunedTestEntryPath,
+    symbol: seed.source === "python-test-suite" ? prunedTestEntryPath : seed.symbol,
+    ownedFiles,
+    summary:
+      seed.source === "python-source-group"
+        ? ownedFiles.length === 1
+          ? `Python source file ${ownedFiles[0]?.path}.`
+          : `Python source group ${seed.entryPath} with ${ownedFiles.length} files.`
+        : prunedTestEntryPath === "."
+          ? "Python pytest files at repository root."
+          : `Python pytest files in ${prunedTestEntryPath}.`,
+  };
+  if (seed.contextFiles !== undefined) {
+    pruned.contextFiles = seed.contextFiles.filter(
+      (file) => !pathTouchesUvMember(file.path, members),
+    );
+  }
+  if (seed.tests !== undefined) {
+    pruned.tests = seed.tests.filter((test) => !pathTouchesUvMember(test.path, members));
+  }
+  if (seed.testPrefixes !== undefined) {
+    pruned.testPrefixes = seed.testPrefixes.filter(
+      (prefix) => !pathTouchesUvMember(prefix, members),
+    );
+  }
+  return pruned;
+}
+
+function seedOwnedOrEntryTouchesUvMember(seed: FeatureSeed, members: readonly string[]): boolean {
+  return (
+    pathTouchesUvMember(seed.entryPath, members) ||
+    (seed.ownedFiles?.some((file) => pathTouchesUvMember(file.path, members)) ?? false)
+  );
+}
+
+function pruneSeedUvMemberReferences(seed: FeatureSeed, members: readonly string[]): FeatureSeed {
+  const pruned: FeatureSeed = { ...seed };
+  if (seed.contextFiles !== undefined) {
+    pruned.contextFiles = seed.contextFiles.filter(
+      (file) => !pathTouchesUvMember(file.path, members),
+    );
+  }
+  if (seed.tests !== undefined) {
+    pruned.tests = seed.tests.filter((test) => !pathTouchesUvMember(test.path, members));
+  }
+  if (seed.testPrefixes !== undefined) {
+    pruned.testPrefixes = seed.testPrefixes.filter(
+      (prefix) => !pathTouchesUvMember(prefix, members),
+    );
+  }
+  return pruned;
+}
+
+function pathTouchesUvMember(path: string, members: readonly string[]): boolean {
+  return members.some((member) => pathMatchesPrefix(path, member));
+}
+
+function seedRepoPaths(seed: FeatureSeed): string[] {
+  return uniquePaths([
+    seed.entryPath,
+    ...(seed.ownedFiles?.map((file) => file.path) ?? []),
+    ...(seed.contextFiles?.map((file) => file.path) ?? []),
+    ...(seed.tests?.map((test) => test.path) ?? []),
+    ...(seed.testPrefixes ?? []),
+  ]);
+}
+
+async function workspaceMemberSeed(
+  workspaceRoot: string,
+  seed: FeatureSeed,
+  member: string,
+): Promise<FeatureSeed> {
+  const prefixPath = (path: string): string => `${member}/${path}`;
+  const genericSource = seed.source === "python-source-group";
+  const genericTestSuite = seed.source === "python-test-suite";
+  const entryPath = prefixPath(seed.entryPath);
+  const contextFiles =
+    seed.contextFiles === undefined
+      ? undefined
+      : seed.contextFiles.map((file) => ({
+          ...file,
+          path: prefixPath(file.path),
+        }));
+  const workspaceRuntimeContext = await pythonRuntimeContextFiles(
+    workspaceRoot,
+    seed.ownedFiles === undefined
+      ? [entryPath]
+      : seed.ownedFiles.map((file) => prefixPath(file.path)),
+  );
+  return {
+    ...seed,
+    title: genericSource
+      ? `Python source ${entryPath}`
+      : genericTestSuite
+        ? `Python test suite ${entryPath}`
+        : seed.title,
+    summary: workspaceMemberSummary(seed, member),
+    entryPath,
+    symbol:
+      (genericSource || genericTestSuite) && seed.symbol !== null
+        ? prefixPath(seed.symbol)
+        : seed.symbol,
+    tags: uniquePaths([...seed.tags, "workspace", "uv-workspace"]),
+    ...(seed.ownedFiles === undefined
+      ? {}
+      : { ownedFiles: seed.ownedFiles.map((file) => ({ ...file, path: prefixPath(file.path) })) }),
+    contextFiles: uniqueSeedFileRefs([...(contextFiles ?? []), ...workspaceRuntimeContext]),
+    ...(seed.tests === undefined
+      ? {}
+      : { tests: seed.tests.map((test) => ({ ...test, path: prefixPath(test.path) })) }),
+    ...(seed.testPrefixes === undefined ? {} : { testPrefixes: seed.testPrefixes.map(prefixPath) }),
+  };
+}
+
+function uniqueSeedFileRefs(refs: SeedFileRef[]): SeedFileRef[] {
+  const seen = new Set<string>();
+  const output: SeedFileRef[] = [];
+  for (const ref of refs) {
+    if (seen.has(ref.path)) {
+      continue;
+    }
+    seen.add(ref.path);
+    output.push(ref);
+  }
+  return output;
+}
+
+function workspaceMemberSummary(seed: FeatureSeed, member: string): string {
+  if (seed.source === "python-source-group") {
+    return prefixedPythonSourceSummary(seed, member);
+  }
+  if (seed.source === "python-test-suite") {
+    return `Python pytest files in ${member}/${seed.entryPath}.`;
+  }
+  const memberPaths = uniquePaths([
+    seed.entryPath,
+    ...(seed.ownedFiles?.map((file) => file.path) ?? []),
+    ...(seed.contextFiles?.map((file) => file.path) ?? []),
+    ...(seed.tests?.map((test) => test.path) ?? []),
+  ]).toSorted((left, right) => right.length - left.length);
+  let summary = seed.summary;
+  for (const path of memberPaths) {
+    summary = summary.split(path).join(`${member}/${path}`);
+  }
+  return summary;
+}
+
+function prefixedPythonSourceSummary(seed: FeatureSeed, member: string): string {
+  const ownedFiles = seed.ownedFiles?.map((file) => `${member}/${file.path}`) ?? [];
+  if (ownedFiles.length === 1) {
+    return `Python source file ${ownedFiles[0]}.`;
+  }
+  return `Python source group ${member}/${seed.entryPath} with ${ownedFiles.length} files.`;
+}
+
+async function uvWorkspaceMemberDirs(root: string): Promise<string[]> {
+  if (!(await pathExists(join(root, "pyproject.toml")))) {
+    return [];
+  }
+  const source = await readFile(join(root, "pyproject.toml"), "utf8");
+  const workspace = table(source, "tool.uv.workspace");
+  if (workspace.length === 0) {
+    return [];
+  }
+  const members = workspaceArrayValues(workspace, "members");
+  const excludes = workspaceArrayValues(workspace, "exclude").map(workspaceMemberPath);
+  const dirs = new Set<string>();
+  for (const value of members) {
+    const member = workspaceMemberPath(value);
+    if (!isSafeWorkspacePattern(member)) {
+      continue;
+    }
+    const candidates = hasWorkspaceGlob(member)
+      ? await expandWorkspaceMemberPattern(root, member)
+      : [member];
+    for (const candidate of candidates) {
+      if (
+        candidate.length > 0 &&
+        candidate !== "." &&
+        !workspaceMemberExcluded(candidate, excludes) &&
+        (await isSafeDirectory(root, join(root, candidate))) &&
+        (await isSafeFile(root, join(root, candidate, "pyproject.toml")))
+      ) {
+        dirs.add(candidate);
+      }
+    }
+  }
+  return [...dirs].toSorted();
+}
+
+function workspaceArrayValues(source: string, key: string): string[] {
+  return tomlArrayAssignments(source, [key]).flatMap(arrayValues);
+}
+
+function workspaceMemberPath(path: string): string {
+  return normalize(path).replace(/^\.\//u, "").replace(/\/+$/u, "");
+}
+
+function isSafeWorkspacePattern(path: string): boolean {
+  return isSafeWorkspacePath(path.replace(/[*?]/gu, "x"));
+}
+
+function isSafeWorkspacePath(path: string): boolean {
+  return (
+    path.length > 0 && path !== "." && !path.startsWith("/") && !path.split("/").includes("..")
+  );
+}
+
+function hasWorkspaceGlob(path: string): boolean {
+  return /[*?]/u.test(path);
+}
+
+async function expandWorkspaceMemberPattern(root: string, pattern: string): Promise<string[]> {
+  const members: string[] = [];
+  const parts = pattern.split("/");
+  async function visit(base: string, remaining: string[]): Promise<void> {
+    const [part, ...rest] = remaining;
+    if (part === undefined) {
+      if (
+        base.length > 0 &&
+        base !== "." &&
+        (await isSafeDirectory(root, join(root, base))) &&
+        (await isSafeFile(root, join(root, base, "pyproject.toml")))
+      ) {
+        members.push(base);
+      }
+      return;
+    }
+    if (part === "**") {
+      await visit(base, rest);
+      for (const entry of await safeWorkspaceEntries(root, base)) {
+        const next = base.length === 0 ? entry : `${base}/${entry}`;
+        await visit(next, remaining);
+      }
+      return;
+    }
+    if (!hasWorkspaceGlob(part)) {
+      await visit(base.length === 0 ? part : `${base}/${part}`, rest);
+      return;
+    }
+    const matcher = workspaceGlobSegmentRegExp(part);
+    for (const entry of await safeWorkspaceEntries(root, base)) {
+      if (matcher.test(entry)) {
+        await visit(base.length === 0 ? entry : `${base}/${entry}`, rest);
+      }
+    }
+  }
+  await visit("", parts);
+  return members;
+}
+
+async function safeWorkspaceEntries(root: string, base: string): Promise<string[]> {
+  const dir = join(root, base);
+  if (!(await isSafeDirectory(root, dir))) {
+    return [];
+  }
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  return entries
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .filter((entry) => {
+      const path = base.length === 0 ? entry : `${base}/${entry}`;
+      return !pythonShouldSkip(path);
+    })
+    .toSorted();
+}
+
+function workspaceMemberExcluded(member: string, excludes: string[]): boolean {
+  return excludes.some((exclude) => workspacePatternMatches(exclude, member));
+}
+
+function workspacePatternMatches(pattern: string, member: string): boolean {
+  if (!isSafeWorkspacePattern(pattern)) {
+    return false;
+  }
+  return workspaceGlobMatches(pattern, member);
+}
+
+function workspaceGlobMatches(pattern: string, member: string): boolean {
+  const patternParts = pattern.split("/");
+  const memberParts = member.split("/");
+  function match(patternIndex: number, memberIndex: number): boolean {
+    const part = patternParts[patternIndex];
+    if (part === undefined) {
+      return memberIndex === memberParts.length;
+    }
+    if (part === "**") {
+      return (
+        match(patternIndex + 1, memberIndex) ||
+        (memberIndex < memberParts.length && match(patternIndex, memberIndex + 1))
+      );
+    }
+    const memberPart = memberParts[memberIndex];
+    return (
+      memberPart !== undefined &&
+      workspaceGlobSegmentRegExp(part).test(memberPart) &&
+      match(patternIndex + 1, memberIndex + 1)
+    );
+  }
+  return match(0, 0);
+}
+
+function workspaceGlobSegmentRegExp(segment: string): RegExp {
+  const escaped = segment.replace(/[.+^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/gu, "[^/]*").replace(/\?/gu, "[^/]")}$`, "u");
 }
 
 async function isPythonProject(root: string): Promise<boolean> {
@@ -220,6 +631,87 @@ async function pythonMetadataFiles(root: string): Promise<string[]> {
     }
   }
   return files;
+}
+
+async function pythonRuntimeContextFiles(
+  root: string,
+  featurePaths: readonly string[] = [""],
+): Promise<SeedFileRef[]> {
+  const files: SeedFileRef[] = [];
+  const seen = new Set<string>();
+  for (const featurePath of uniquePaths([...featurePaths])) {
+    for (const ref of await nearestPythonRuntimeContextFiles(root, featurePath)) {
+      if (!seen.has(ref.path)) {
+        seen.add(ref.path);
+        files.push(ref);
+      }
+    }
+  }
+  return files;
+}
+
+async function nearestPythonRuntimeContextFiles(
+  root: string,
+  featurePath: string,
+): Promise<SeedFileRef[]> {
+  const refs: SeedFileRef[] = [];
+  for (const dir of ancestorDirs(dirname(featurePath))) {
+    let foundRuntimeConstraint = false;
+    for (const fileName of runtimeMetadataFiles) {
+      const path = dir.length === 0 ? fileName : `${dir}/${fileName}`;
+      if (await pathExists(join(root, path))) {
+        refs.push({ path, reason: "python target runtime metadata" });
+        foundRuntimeConstraint ||= await pythonRuntimeFileDeclaresVersion(root, path);
+      }
+    }
+    if (foundRuntimeConstraint) {
+      return refs;
+    }
+  }
+  return refs;
+}
+
+async function pythonRuntimeFileDeclaresVersion(root: string, path: string): Promise<boolean> {
+  const name = basename(path);
+  if (name === ".python-version" || name === "runtime.txt") {
+    return true;
+  }
+  if (name === ".tool-versions") {
+    const source = await readFile(join(root, path), "utf8").catch(() => "");
+    return /^\s*(?:python|python3)\s+\S+/mu.test(source);
+  }
+  if (name === "pyproject.toml") {
+    const source = await readFile(join(root, path), "utf8").catch(() => "");
+    return (
+      /^\s*requires-python\s*=/mu.test(source) ||
+      tomlStringValue(table(source, "tool.poetry.dependencies"), "python") !== null
+    );
+  }
+  if (name === "setup.cfg") {
+    const source = await readFile(join(root, path), "utf8").catch(() => "");
+    return /^\s*python_requires\s*=/mu.test(source);
+  }
+  if (name === "setup.py") {
+    const source = await readFile(join(root, path), "utf8").catch(() => "");
+    return /\bpython_requires\s*=/u.test(source);
+  }
+  return false;
+}
+
+function ancestorDirs(start: string): string[] {
+  const dirs: string[] = [];
+  let current = normalizeRelativeDir(start);
+  for (;;) {
+    dirs.push(current);
+    if (current.length === 0) {
+      return dirs;
+    }
+    current = normalizeRelativeDir(dirname(current));
+  }
+}
+
+function normalizeRelativeDir(path: string): string {
+  return path === "." ? "" : path.replace(/\/+$/u, "");
 }
 
 async function pythonTestCommand(root: string, pyproject: PyprojectInfo): Promise<string | null> {
@@ -276,8 +768,8 @@ async function dependencyFileHas(root: string, dependency: string): Promise<bool
   return false;
 }
 
-async function pythonSourceGroups(root: string): Promise<SourceGroup[]> {
-  const groups: SourceGroup[] = [];
+async function pythonSourceGroups(root: string): Promise<FileGroup[]> {
+  const groups: FileGroup[] = [];
   groups.push(...(await rootPythonSourceGroups(root)));
   const seenRoots = new Set<string>();
   for (const sourceRoot of await pythonSourceRoots(root)) {
@@ -286,15 +778,15 @@ async function pythonSourceGroups(root: string): Promise<SourceGroup[]> {
     }
     seenRoots.add(sourceRoot);
     const files = (await walk(root, [sourceRoot])).filter(isReviewablePythonSourceFile);
-    for (const group of partitionSourceFiles(sourceRoot, files, sourceGroupMaxOwnedFiles)) {
+    for (const group of partitionFileGroups(sourceRoot, files, sourceGroupMaxOwnedFiles)) {
       groups.push(group);
     }
   }
   return groups;
 }
 
-async function rootPythonSourceGroups(root: string): Promise<SourceGroup[]> {
-  return chunkFiles("root", await rootPythonSourceFiles(root), sourceGroupMaxOwnedFiles);
+async function rootPythonSourceGroups(root: string): Promise<FileGroup[]> {
+  return partitionFileGroups("root", await rootPythonSourceFiles(root), sourceGroupMaxOwnedFiles);
 }
 
 async function rootPythonSourceFiles(root: string): Promise<string[]> {
@@ -378,6 +870,647 @@ async function resolvePythonScript(
   return { entryPath: metadataPath, symbol };
 }
 
+async function djangoRouteSeeds(
+  root: string,
+  testFiles: string[],
+  testCommand: string | null,
+): Promise<FeatureSeed[]> {
+  const hasDjangoDependency = await pythonDependencyHas(root, "django");
+  const routeFiles = uniquePaths([
+    ...(await rootPythonSourceFiles(root)),
+    ...(await walk(root, await pythonSourceRoots(root))).filter(isReviewablePythonSourceFile),
+  ]);
+  const seeds: FeatureSeed[] = [];
+  const routesByFile = new Map<string, DjangoRoute[]>();
+  for (const filePath of routeFiles) {
+    const source = await readFile(join(root, filePath), "utf8");
+    if (!sourceLooksDjangoUrls(filePath, source, hasDjangoDependency)) {
+      continue;
+    }
+    routesByFile.set(filePath, parseDjangoRoutes(filePath, source));
+  }
+  const includedRouteFiles = await djangoIncludedRouteFiles(root, routesByFile);
+  const routeFilesToSeed = [...routesByFile.keys()].filter(
+    (filePath) => !includedRouteFiles.has(filePath),
+  );
+  for (const filePath of routeFilesToSeed) {
+    const routes = routesByFile.get(filePath) ?? [];
+    for (const route of routes) {
+      for (const expanded of await expandDjangoIncludedRoutes(
+        root,
+        route,
+        routesByFile,
+        new Set([filePath]),
+      )) {
+        const tests = associatedTests([expanded.filePath], testFiles, testCommand);
+        seeds.push({
+          title: `Django route ${expanded.routePath}`,
+          summary: djangoRouteSummary(expanded),
+          kind: "route",
+          source: "python-django-route",
+          confidence: "high",
+          entryPath: expanded.filePath,
+          symbol: expanded.symbol,
+          route: expanded.routePath,
+          command: null,
+          ownedFiles: [{ path: expanded.filePath, reason: "Django URL route declaration" }],
+          contextFiles: [
+            ...(await pythonRuntimeContextFiles(root, [expanded.filePath])),
+            ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+          ],
+          tests,
+          tags: ["python", "django", "route"],
+          trustBoundaries: djangoRouteTrustBoundaries(expanded),
+          testCommand,
+          skipNearbyTests: true,
+        });
+      }
+    }
+  }
+  return seeds;
+}
+
+async function djangoIncludedRouteFiles(
+  root: string,
+  routesByFile: Map<string, DjangoRoute[]>,
+): Promise<Set<string>> {
+  const included = new Set<string>();
+  for (const routes of routesByFile.values()) {
+    for (const route of routes) {
+      if (!route.include || route.symbol === null) {
+        continue;
+      }
+      const includePath = await resolveDjangoIncludeModule(root, route.symbol);
+      if (includePath !== null && routesByFile.has(includePath)) {
+        included.add(includePath);
+      }
+    }
+  }
+  return included;
+}
+
+async function expandDjangoIncludedRoutes(
+  root: string,
+  route: DjangoRoute,
+  routesByFile: Map<string, DjangoRoute[]>,
+  visited: Set<string>,
+): Promise<DjangoRoute[]> {
+  const routes = [route];
+  if (!route.include || route.symbol === null) {
+    return routes;
+  }
+  const includePath = await resolveDjangoIncludeModule(root, route.symbol);
+  if (includePath === null || visited.has(includePath)) {
+    return routes;
+  }
+  let includedRoutes = routesByFile.get(includePath);
+  if (includedRoutes === undefined) {
+    const source = await readFile(join(root, includePath), "utf8");
+    includedRoutes = parseDjangoRoutes(includePath, source);
+    routesByFile.set(includePath, includedRoutes);
+  }
+  const nextVisited = new Set([...visited, includePath]);
+  for (const included of includedRoutes) {
+    const mounted = {
+      ...included,
+      routePath: joinDjangoRoutePaths(route.routePath, included.routePath),
+    };
+    routes.push(...(await expandDjangoIncludedRoutes(root, mounted, routesByFile, nextVisited)));
+  }
+  return routes;
+}
+
+async function resolveDjangoIncludeModule(
+  root: string,
+  moduleName: string,
+): Promise<string | null> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/u.test(moduleName)) {
+    return null;
+  }
+  const modulePath = `${moduleName.replace(/\./gu, "/")}.py`;
+  const candidates = new Set<string>([modulePath]);
+  for (const sourceRoot of await pythonSourceRoots(root)) {
+    candidates.add(`${sourceRoot}/${modulePath}`);
+  }
+  for (const candidate of candidates) {
+    if (await isSafeFile(root, join(root, candidate))) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function joinDjangoRoutePaths(prefix: string, route: string): string {
+  if (prefix === "/") {
+    return route;
+  }
+  if (route === "/") {
+    return prefix;
+  }
+  return normalizeDjangoRoutePath(`${prefix.replace(/^\/+/u, "")}${route.replace(/^\/+/u, "")}`);
+}
+
+function sourceLooksDjangoUrls(
+  filePath: string,
+  source: string,
+  hasDjangoDependency: boolean,
+): boolean {
+  if (!/(^|\/)urls\.py$/u.test(filePath) || djangoUrlpatternsAssignments(source).length === 0) {
+    return false;
+  }
+  if (sourceLooksDjangoUrlsImport(source)) {
+    return true;
+  }
+  return hasDjangoDependency;
+}
+
+function sourceLooksDjangoUrlsImport(source: string): boolean {
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    const stringEnd = pythonStringEnd(source, index);
+    if (stringEnd !== null) {
+      index = stringEnd;
+      continue;
+    }
+    if (char === "#") {
+      index = pythonCommentEnd(source, index);
+      continue;
+    }
+    if (!isPythonLineStart(source, index)) {
+      continue;
+    }
+    const lineEnd = source.indexOf("\n", index);
+    const rawLine = source.slice(index, lineEnd === -1 ? source.length : lineEnd);
+    if (
+      /^(?:from\s+django\.(?:urls|conf\.urls)\s+import\s+|import\s+django\.(?:urls|conf\.urls)\b)/u.test(
+        rawLine,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseDjangoRoutes(filePath: string, source: string): DjangoRoute[] {
+  const routes: DjangoRoute[] = [];
+  for (const call of djangoRouteCalls(source)) {
+    const route = parseDjangoRouteCall(filePath, call);
+    if (route !== null) {
+      routes.push(route);
+    }
+  }
+  return uniqueDjangoRoutes(routes);
+}
+
+function djangoRouteCalls(source: string): string[] {
+  return djangoUrlpatternsBodies(source).flatMap(djangoRouteCallsInUrlpatterns);
+}
+
+function djangoUrlpatternsBodies(source: string): string[] {
+  const bodies: string[] = [];
+  for (const assignment of djangoUrlpatternsAssignments(source)) {
+    const valueIndex = nextPythonValueIndex(source, assignment.valueStart);
+    if (source[valueIndex] !== "[") {
+      continue;
+    }
+    const end = matchingPythonBracketEnd(source, valueIndex);
+    if (end !== null) {
+      bodies.push(source.slice(valueIndex + 1, end));
+    }
+  }
+  return bodies;
+}
+
+function djangoUrlpatternsAssignments(source: string): Array<{ valueStart: number }> {
+  const assignments: Array<{ valueStart: number }> = [];
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    const stringEnd = pythonStringEnd(source, index);
+    if (stringEnd !== null) {
+      index = stringEnd;
+      continue;
+    }
+    if (char === "#") {
+      index = pythonCommentEnd(source, index);
+      continue;
+    }
+    if (!isPythonLineStart(source, index)) {
+      continue;
+    }
+    if (!source.startsWith("urlpatterns", index)) {
+      continue;
+    }
+    const lineEnd = source.indexOf("\n", index);
+    const rawLine = source.slice(index, lineEnd === -1 ? source.length : lineEnd);
+    const match = /^urlpatterns\s*(?::[^=\n]+)?\s*(\+?=)/u.exec(rawLine);
+    if (match?.[0] !== undefined) {
+      assignments.push({ valueStart: index + match[0].length });
+    }
+  }
+  return assignments;
+}
+
+function isPythonLineStart(source: string, index: number): boolean {
+  return index === 0 || source[index - 1] === "\n";
+}
+
+function nextPythonValueIndex(source: string, index: number): number {
+  let current = index;
+  while (current < source.length) {
+    const char = source[current];
+    if (char === "#") {
+      const newline = source.indexOf("\n", current + 1);
+      current = newline === -1 ? source.length : newline + 1;
+      continue;
+    }
+    if (char === " " || char === "\t" || char === "\r" || char === "\n") {
+      current += 1;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+function matchingPythonBracketEnd(source: string, start: number): number | null {
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    const stringEnd = pythonStringEnd(source, index);
+    if (stringEnd !== null) {
+      index = stringEnd;
+      continue;
+    }
+    if (char === "#") {
+      index = pythonCommentEnd(source, index);
+      continue;
+    }
+    if (char === "[") {
+      depth += 1;
+      continue;
+    }
+    if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return null;
+}
+
+function djangoRouteCallsInUrlpatterns(source: string): string[] {
+  const calls: string[] = [];
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    const stringEnd = pythonStringEnd(source, index);
+    if (stringEnd !== null) {
+      index = stringEnd;
+      continue;
+    }
+    if (char === "#") {
+      index = pythonCommentEnd(source, index);
+      continue;
+    }
+    if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      const call = djangoRouteCallAt(source, index);
+      if (call !== null) {
+        calls.push(call.source);
+        index = call.end;
+        continue;
+      }
+    }
+    if (char === "(") {
+      parenDepth += 1;
+    } else if (char === ")" && parenDepth > 0) {
+      parenDepth -= 1;
+    } else if (char === "[") {
+      bracketDepth += 1;
+    } else if (char === "]" && bracketDepth > 0) {
+      bracketDepth -= 1;
+    } else if (char === "{") {
+      braceDepth += 1;
+    } else if (char === "}" && braceDepth > 0) {
+      braceDepth -= 1;
+    }
+  }
+  return calls;
+}
+
+function djangoRouteCallAt(source: string, index: number): { source: string; end: number } | null {
+  const helper = djangoRouteHelperAt(source, index);
+  if (helper === null) {
+    return null;
+  }
+  let parenIndex = index + helper.length;
+  while (source[parenIndex] === " " || source[parenIndex] === "\t") {
+    parenIndex += 1;
+  }
+  if (source[parenIndex] !== "(") {
+    return null;
+  }
+  const end = matchingPythonParenEnd(source, parenIndex);
+  return end === null ? null : { source: source.slice(index, end + 1), end };
+}
+
+function djangoRouteHelperAt(source: string, index: number): string | null {
+  const previous = source[index - 1];
+  if (previous !== undefined && /[A-Za-z0-9_.]/u.test(previous)) {
+    return null;
+  }
+  for (const helper of ["re_path", "path", "url"]) {
+    if (!source.startsWith(helper, index)) {
+      continue;
+    }
+    const next = source[index + helper.length];
+    if (next === "(" || next === " " || next === "\t") {
+      return helper;
+    }
+  }
+  return null;
+}
+
+function matchingPythonParenEnd(source: string, start: number): number | null {
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    const stringEnd = pythonStringEnd(source, index);
+    if (stringEnd !== null) {
+      index = stringEnd;
+      continue;
+    }
+    if (char === "#") {
+      index = pythonCommentEnd(source, index);
+      continue;
+    }
+    if (char === "(") {
+      depth += 1;
+      continue;
+    }
+    if (char === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return null;
+}
+
+function pythonStringEnd(source: string, start: number): number | null {
+  const quoteStart = pythonStringQuoteStart(source, start);
+  if (quoteStart === null) {
+    return null;
+  }
+  const quote = source[quoteStart];
+  if (quote !== '"' && quote !== "'") {
+    return null;
+  }
+  const triple = source.startsWith(quote.repeat(3), quoteStart);
+  const endQuote = triple ? quote.repeat(3) : quote;
+  let escaped = false;
+  for (let index = quoteStart + endQuote.length; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    if (triple) {
+      if (source.startsWith(endQuote, index)) {
+        return index + endQuote.length - 1;
+      }
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (char === quote) {
+      return index;
+    }
+  }
+  return source.length - 1;
+}
+
+function pythonStringQuoteStart(source: string, start: number): number | null {
+  const char = source[start];
+  if (char === '"' || char === "'") {
+    return start;
+  }
+  if (char === undefined || !/[rRuUbBfF]/u.test(char)) {
+    return null;
+  }
+  let index = start;
+  while (/[rRuUbBfF]/u.test(source[index] ?? "")) {
+    index += 1;
+  }
+  const quote = source[index];
+  if (quote !== '"' && quote !== "'") {
+    return null;
+  }
+  const prefix = source.slice(start, index).toLowerCase();
+  return /^[rubf]+$/u.test(prefix) ? index : null;
+}
+
+function pythonCommentEnd(source: string, start: number): number {
+  const newline = source.indexOf("\n", start + 1);
+  return newline === -1 ? source.length - 1 : newline;
+}
+
+function parseDjangoRouteCall(filePath: string, call: string): DjangoRoute | null {
+  const match = /^\s*(path|re_path|url)\s*\(([\s\S]*)\)\s*,?\s*(?:#.*)?$/u.exec(call);
+  const helper = match?.[1];
+  const args = match?.[2];
+  if (helper === undefined || args === undefined) {
+    return null;
+  }
+  const parts = splitTopLevelPythonArgs(args);
+  const rawRoute = pythonStringLiteralValue(parts[0] ?? "");
+  if (rawRoute === null) {
+    return null;
+  }
+  const routePath =
+    helper === "path" ? normalizeDjangoPathRoute(rawRoute) : normalizeDjangoRegexRoute(rawRoute);
+  if (routePath === null) {
+    return null;
+  }
+  const target = (parts[1] ?? "").trim();
+  const include = target.startsWith("include(");
+  return {
+    filePath,
+    routePath,
+    symbol: include ? djangoIncludeSymbol(target) : djangoHandlerSymbol(target),
+    include,
+  };
+}
+
+function splitTopLevelPythonArgs(source: string): string[] {
+  const args: string[] = [];
+  let start = 0;
+  let quote: string | null = null;
+  let escaped = false;
+  let depth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "(" || char === "[" || char === "{") {
+      depth += 1;
+    } else if (char === ")" || char === "]" || char === "}") {
+      depth -= 1;
+    } else if (char === "," && depth === 0) {
+      args.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  args.push(source.slice(start).trim());
+  return args;
+}
+
+function pythonStringLiteralValue(source: string): string | null {
+  const match = /^\s*([rRuUbBfF]*)(["'])(.*?)\2\s*$/u.exec(source);
+  const prefix = match?.[1] ?? "";
+  const value = match?.[3];
+  if (value === undefined || /f/iu.test(prefix)) {
+    return null;
+  }
+  if (/r/iu.test(prefix)) {
+    return value;
+  }
+  return unescapePythonString(value);
+}
+
+function unescapePythonString(value: string): string {
+  let output = "";
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      output += char;
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else {
+      output += char;
+    }
+  }
+  return escaped ? `${output}\\` : output;
+}
+
+function normalizeDjangoPathRoute(route: string): string | null {
+  const converted = route.replace(
+    /<(?:(?:[A-Za-z_][A-Za-z0-9_]*):)?([A-Za-z_][A-Za-z0-9_]*)>/gu,
+    ":$1",
+  );
+  if (/[<>]/u.test(converted)) {
+    return null;
+  }
+  return normalizeDjangoRoutePath(converted);
+}
+
+function normalizeDjangoRegexRoute(route: string): string | null {
+  let converted = route.replace(/^\^/u, "").replace(/\$$/u, "");
+  if (/\(\?(?:[=!<]|:)/u.test(converted) || /\|/u.test(converted)) {
+    return null;
+  }
+  converted = converted.replace(/\(\?P<([A-Za-z_][A-Za-z0-9_]*)>[^)]+\)/gu, ":$1");
+  if (/[()[\]{}+*?]/u.test(converted) || /\\(?!\/)/u.test(converted)) {
+    return null;
+  }
+  return normalizeDjangoRoutePath(converted.replace(/\\\//gu, "/"));
+}
+
+function normalizeDjangoRoutePath(route: string): string {
+  const trimmed = route.replace(/^\/+/u, "");
+  return trimmed.length === 0 ? "/" : `/${trimmed}`;
+}
+
+function djangoIncludeSymbol(target: string): string | null {
+  const match = /^include\s*\(([\s\S]*)\)\s*$/u.exec(target);
+  const args = match?.[1];
+  if (args === undefined) {
+    return null;
+  }
+  return pythonStringLiteralValue(splitTopLevelPythonArgs(args)[0] ?? "");
+}
+
+function djangoHandlerSymbol(target: string): string | null {
+  const viewCall =
+    /^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.as_view\s*\(\s*\)\s*$/u.exec(
+      target,
+    )?.[1];
+  if (viewCall !== undefined) {
+    return `${viewCall}.as_view`;
+  }
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/u.test(target) ? target : null;
+}
+
+function djangoRouteSummary(route: DjangoRoute): string {
+  if (route.include) {
+    return `Django URL include ${route.routePath} declared in ${route.filePath}.`;
+  }
+  if (route.symbol !== null) {
+    return `Django route ${route.routePath} handled by ${route.symbol} in ${route.filePath}.`;
+  }
+  return `Django route ${route.routePath} declared in ${route.filePath}.`;
+}
+
+function djangoRouteTrustBoundaries(route: DjangoRoute): FeatureSeed["trustBoundaries"] {
+  const boundaries: FeatureSeed["trustBoundaries"] = ["network", "user-input", "serialization"];
+  if (
+    /(^|\/)(admin|auth|login|logout|token|session|user|account|password|register|signup)(\/|$)/iu.test(
+      route.routePath,
+    )
+  ) {
+    boundaries.push("auth");
+  }
+  return boundaries;
+}
+
+function uniqueDjangoRoutes(routes: DjangoRoute[]): DjangoRoute[] {
+  const seen = new Set<string>();
+  const output: DjangoRoute[] = [];
+  for (const route of routes) {
+    const key = `${route.filePath}:${route.routePath}:${route.symbol ?? ""}:${String(route.include)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(route);
+  }
+  return output;
+}
+
 async function fastApiRouteSeeds(
   root: string,
   testFiles: string[],
@@ -412,7 +1545,10 @@ async function fastApiRouteSeeds(
         ownedFiles: [
           { path: route.filePath, reason: `FastAPI route handler ${route.functionName}` },
         ],
-        contextFiles: tests.map((test) => ({ path: test.path, reason: "associated test" })),
+        contextFiles: [
+          ...(await pythonRuntimeContextFiles(root, [route.filePath])),
+          ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+        ],
         tests,
         tags: ["python", "fastapi", "route"],
         trustBoundaries: fastApiRouteTrustBoundaries(route),
@@ -430,7 +1566,8 @@ function sourceLooksFastApi(source: string): boolean {
 
 function parseFastApiRoutes(filePath: string, source: string): FastApiRoute[] {
   const routes: FastApiRoute[] = [];
-  let pending: Array<{ routePath: string; methods: string[] }> = [];
+  const prefixes = parseFastApiRouterPrefixes(source);
+  let pending: Array<{ target: string; routePath: string; methods: string[] }> = [];
   let decoratorSource: string | null = null;
   let decoratorDepth = 0;
   for (const line of source.split("\n")) {
@@ -466,7 +1603,12 @@ function parseFastApiRoutes(filePath: string, source: string): FastApiRoute[] {
     const functionName = /^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/u.exec(line)?.[1];
     if (functionName !== undefined && pending.length > 0) {
       for (const item of pending) {
-        routes.push({ filePath, functionName, ...item });
+        routes.push({
+          filePath,
+          functionName,
+          routePath: combineFastApiPaths(prefixes.get(item.target) ?? "", item.routePath),
+          methods: item.methods,
+        });
       }
       pending = [];
       continue;
@@ -488,11 +1630,14 @@ function startsFastApiRouteDecorator(line: string): boolean {
   return fastApiRouteDecoratorStartPattern.test(line);
 }
 
-function parseFastApiRouteDecorator(line: string): { routePath: string; methods: string[] } | null {
+function parseFastApiRouteDecorator(
+  line: string,
+): { target: string; routePath: string; methods: string[] } | null {
   const match = fastApiRouteDecoratorPattern.exec(line);
-  const method = match?.[1];
-  const args = match?.[2];
-  if (method === undefined || args === undefined) {
+  const target = match?.[1];
+  const method = match?.[2];
+  const args = match?.[3];
+  if (target === undefined || method === undefined || args === undefined) {
     return null;
   }
   const routePath = parseFastApiPath(args);
@@ -503,7 +1648,86 @@ function parseFastApiRouteDecorator(line: string): { routePath: string; methods:
   if (methods === null) {
     return null;
   }
-  return { routePath, methods };
+  return { target, routePath, methods };
+}
+
+function parseFastApiRouterPrefixes(source: string): Map<string, string> {
+  const prefixes = new Map<string, string>();
+  const routerCallPattern = /\bAPIRouter\s*\(/gu;
+  for (const match of source.matchAll(routerCallPattern)) {
+    const callStart = match.index;
+    const openParenIndex = source.indexOf("(", callStart);
+    if (openParenIndex === -1) {
+      continue;
+    }
+    const prefixSegment = source.slice(0, callStart).trimEnd();
+    const varName =
+      /(?:^|[\n;])\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n;]+)?=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?$/u.exec(
+        prefixSegment,
+      )?.[1];
+    if (varName === undefined) {
+      continue;
+    }
+    const closeParenIndex = findBalancedParenthesis(source, openParenIndex + 1);
+    if (closeParenIndex === -1) {
+      continue;
+    }
+    const args = splitTopLevelPythonArgs(source.slice(openParenIndex + 1, closeParenIndex));
+    const prefixArg = args.find((arg) => /^\s*prefix\s*=/u.test(arg));
+    const prefix = /^\s*prefix\s*=\s*([\s\S]*)$/u.exec(prefixArg ?? "")?.[1];
+    if (prefix === undefined) {
+      continue;
+    }
+    const value = pythonStringLiteralValue(prefix);
+    if (value !== null) {
+      prefixes.set(varName, value);
+    }
+  }
+  return prefixes;
+}
+
+function findBalancedParenthesis(source: string, start: number): number {
+  let depth = 1;
+  let quote: string | null = null;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "(") {
+      depth += 1;
+    } else if (char === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+function combineFastApiPaths(prefix: string, routePath: string): string {
+  const cleanPrefix = prefix.trim().replace(/^\/+/u, "").replace(/\/+$/u, "");
+  const normalizedPrefix = cleanPrefix.length === 0 ? "" : `/${cleanPrefix}`;
+  const cleanPath = routePath.trim().replace(/^\/+/u, "");
+  if (cleanPath.length === 0 && routePath.trim().length === 0) {
+    return normalizedPrefix || "/";
+  }
+  const normalizedPath = cleanPath.length === 0 ? "/" : `/${cleanPath}`;
+  return `${normalizedPrefix}${normalizedPath}`;
 }
 
 function parseFastApiPath(args: string): string | null {
@@ -542,7 +1766,10 @@ async function flaskRouteSeeds(
         route: `${methodLabel} ${route.routePath}`,
         command: null,
         ownedFiles: [{ path: route.filePath, reason: `Flask route handler ${route.functionName}` }],
-        contextFiles: tests.map((test) => ({ path: test.path, reason: "associated test" })),
+        contextFiles: [
+          ...(await pythonRuntimeContextFiles(root, [route.filePath])),
+          ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+        ],
         tests,
         tags: ["python", "flask", "route"],
         trustBoundaries: flaskRouteTrustBoundaries(route),
@@ -583,7 +1810,8 @@ function sourceLooksFlask(source: string): boolean {
 
 function parseFlaskRoutes(filePath: string, source: string): FlaskRoute[] {
   const routes: FlaskRoute[] = [];
-  let pending: Array<{ routePath: string; methods: string[] }> = [];
+  const prefixes = parseFlaskBlueprintPrefixes(source);
+  let pending: Array<{ target: string; routePath: string; methods: string[] }> = [];
   let decoratorSource: string | null = null;
   let decoratorDepth = 0;
   for (const line of source.split("\n")) {
@@ -619,7 +1847,12 @@ function parseFlaskRoutes(filePath: string, source: string): FlaskRoute[] {
     const functionName = /^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/u.exec(line)?.[1];
     if (functionName !== undefined && pending.length > 0) {
       for (const item of pending) {
-        routes.push({ filePath, functionName, ...item });
+        routes.push({
+          filePath,
+          functionName,
+          routePath: combineFastApiPaths(prefixes.get(item.target) ?? "", item.routePath),
+          methods: item.methods,
+        });
       }
       pending = [];
       continue;
@@ -641,21 +1874,142 @@ function startsFlaskRouteDecorator(line: string): boolean {
   return /^@[A-Za-z_][A-Za-z0-9_.]*\.route\(/u.test(line);
 }
 
-function parseFlaskRouteDecorator(line: string): { routePath: string; methods: string[] } | null {
-  const match = /^\s*@[A-Za-z_][A-Za-z0-9_.]*\.route\(\s*(["'])(.*?)\1(.*)\)\s*(?:#.*)?$/u.exec(
+function parseFlaskRouteDecorator(
+  line: string,
+): { target: string; routePath: string; methods: string[] } | null {
+  const match = /^\s*@([A-Za-z_][A-Za-z0-9_.]*)\.route\(\s*(["'])(.*?)\2(.*)\)\s*(?:#.*)?$/u.exec(
     line,
   );
-  if (match?.[2] === undefined) {
+  const target = match?.[1];
+  const routePath = match?.[3];
+  if (target === undefined || routePath === undefined) {
     return null;
   }
-  const methods = parsePythonRouteMethods(match[3] ?? "");
+  const methods = parsePythonRouteMethods(match?.[4] ?? "");
   if (methods === null) {
     return null;
   }
   return {
-    routePath: match[2],
+    target,
+    routePath,
     methods,
   };
+}
+
+function parseFlaskBlueprintPrefixes(source: string): Map<string, string | null> {
+  const prefixes = new Map<string, string | null>();
+  for (const [target, prefix] of parseFlaskBlueprintConstructorPrefixes(source)) {
+    prefixes.set(target, prefix);
+  }
+  for (const [target, prefix] of parseFlaskBlueprintRegistrationPrefixes(source)) {
+    prefixes.set(target, prefix);
+  }
+  return prefixes;
+}
+
+function parseFlaskBlueprintConstructorPrefixes(source: string): Map<string, string> {
+  const prefixes = new Map<string, string>();
+  const blueprintCallPattern = /\bBlueprint\s*\(/gu;
+  for (const match of source.matchAll(blueprintCallPattern)) {
+    const callStart = match.index;
+    const openParenIndex = source.indexOf("(", callStart);
+    if (openParenIndex === -1) {
+      continue;
+    }
+    const prefixSegment = source.slice(0, callStart).trimEnd();
+    const varName =
+      /(?:^|[\n;])\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n;]+)?=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?$/u.exec(
+        prefixSegment,
+      )?.[1];
+    if (varName === undefined) {
+      continue;
+    }
+    const closeParenIndex = findBalancedParenthesis(source, openParenIndex + 1);
+    if (closeParenIndex === -1) {
+      continue;
+    }
+    const args = splitTopLevelPythonArgs(source.slice(openParenIndex + 1, closeParenIndex));
+    const prefix = parsePythonKeywordStringArg(args, "url_prefix");
+    if (prefix !== null) {
+      prefixes.set(varName, prefix);
+    }
+  }
+  return prefixes;
+}
+
+function parseFlaskBlueprintRegistrationPrefixes(source: string): Map<string, string | null> {
+  const prefixes = new Map<string, string | null>();
+  const registerCallPattern = /\.register_blueprint\s*\(/gu;
+  for (const match of source.matchAll(registerCallPattern)) {
+    const callStart = match.index;
+    const openParenIndex = source.indexOf("(", callStart);
+    if (openParenIndex === -1) {
+      continue;
+    }
+    const closeParenIndex = findBalancedParenthesis(source, openParenIndex + 1);
+    if (closeParenIndex === -1) {
+      continue;
+    }
+    const args = splitTopLevelPythonArgs(source.slice(openParenIndex + 1, closeParenIndex));
+    const target = args[0]?.trim();
+    if (target === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(target)) {
+      continue;
+    }
+    const prefixValue = parsePythonKeywordArgValue(args, "url_prefix");
+    if (prefixValue !== undefined) {
+      const normalizedPrefixValue = stripPythonInlineComment(prefixValue).trim();
+      if (normalizedPrefixValue === "None") {
+        continue;
+      }
+      prefixes.set(target, pythonStringLiteralValue(normalizedPrefixValue));
+    }
+  }
+  return prefixes;
+}
+
+function parsePythonKeywordStringArg(args: string[], name: string): string | null {
+  const value = parsePythonKeywordArgValue(args, name);
+  return value === undefined
+    ? null
+    : pythonStringLiteralValue(stripPythonInlineComment(value).trim());
+}
+
+function parsePythonKeywordArgValue(args: string[], name: string): string | undefined {
+  const pattern = new RegExp(`^\\s*${name}\\s*=\\s*([\\s\\S]*)$`, "u");
+  return pattern.exec(args.find((arg) => pattern.test(arg)) ?? "")?.[1];
+}
+
+function stripPythonInlineComment(source: string): string {
+  let quote: string | null = null;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === undefined) {
+      break;
+    }
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "#") {
+      return source.slice(0, index);
+    }
+  }
+  return source;
 }
 
 function parsePythonRouteMethods(args: string): string[] | null {
@@ -768,32 +2122,40 @@ function fastApiRouteTrustBoundaries(route: FastApiRoute): FeatureSeed["trustBou
   return boundaries;
 }
 
-function standaloneTestSuites(testFiles: string[], command: string | null): FeatureSeed[] {
+async function standaloneTestSuites(
+  root: string,
+  testFiles: string[],
+  command: string | null,
+): Promise<FeatureSeed[]> {
   if (testFiles.length === 0) {
     return [];
   }
-  const groups: SourceGroup[] = [];
-  for (const [root, files] of groupedTestFiles(testFiles)) {
-    groups.push(...partitionSourceFiles(root, files, sourceGroupMaxOwnedFiles));
+  const groups: FileGroup[] = [];
+  for (const [suiteRoot, files] of groupedTestFiles(testFiles)) {
+    groups.push(...partitionFileGroups(suiteRoot, files, sourceGroupMaxOwnedFiles));
   }
-  return groups.map((group) => ({
-    title: `Python test suite ${group.label}`,
-    summary: `Python pytest files in ${group.label}.`,
-    kind: "test-suite",
-    source: "python-test-suite",
-    confidence: "medium",
-    entryPath: group.label,
-    symbol: group.label,
-    route: null,
-    command: null,
-    ownedFiles: group.files.map((path) => ({ path, reason: "pytest file" })),
-    contextFiles: [],
-    tests: group.files.map((path) => ({ path, command })),
-    tags: ["python", "test"],
-    trustBoundaries: [],
-    testCommand: command,
-    skipNearbyTests: true,
-  }));
+  const seeds: FeatureSeed[] = [];
+  for (const group of groups) {
+    seeds.push({
+      title: `Python test suite ${group.label}`,
+      summary: `Python pytest files in ${group.label}.`,
+      kind: "test-suite",
+      source: "python-test-suite",
+      confidence: "medium",
+      entryPath: group.label,
+      symbol: group.label,
+      route: null,
+      command: null,
+      ownedFiles: group.files.map((path) => ({ path, reason: "pytest file" })),
+      contextFiles: await pythonRuntimeContextFiles(root, group.files),
+      tests: group.files.map((path) => ({ path, command })),
+      tags: ["python", "test"],
+      trustBoundaries: [],
+      testCommand: command,
+      skipNearbyTests: true,
+    });
+  }
+  return seeds;
 }
 
 function groupedTestFiles(testFiles: string[]): Map<string, string[]> {
@@ -816,115 +2178,6 @@ function testSuiteRoot(path: string): string {
     return first;
   }
   return dirname(path);
-}
-
-function partitionSourceFiles(
-  sourceRoot: string,
-  files: string[],
-  maxFiles: number,
-): SourceGroup[] {
-  return partitionAt(sourceRoot, files.toSorted(), maxFiles, 0);
-}
-
-function partitionAt(
-  sourceRoot: string,
-  files: string[],
-  maxFiles: number,
-  depth: number,
-): SourceGroup[] {
-  if (files.length === 0) {
-    return [];
-  }
-  if (files.length <= maxFiles) {
-    return [{ label: commonLabel(sourceRoot, files, depth), files }];
-  }
-  const directFiles: string[] = [];
-  const buckets = new Map<string, string[]>();
-  for (const file of files) {
-    const relativePath = file.slice(sourceRoot.length + 1);
-    const parts = relativePath.split("/");
-    if (parts.length <= depth + 1) {
-      directFiles.push(file);
-      continue;
-    }
-    const segment = parts[depth];
-    if (segment === undefined) {
-      directFiles.push(file);
-      continue;
-    }
-    const bucket = buckets.get(segment) ?? [];
-    bucket.push(file);
-    buckets.set(segment, bucket);
-  }
-  const groups = chunkFiles(currentLabel(sourceRoot, files, depth), directFiles, maxFiles);
-  for (const [segment, bucketFiles] of [...buckets.entries()].toSorted(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
-    if (bucketFiles.length <= maxFiles) {
-      groups.push({
-        label: `${sourceRoot}/${bucketPrefix(bucketFiles, sourceRoot, depth, segment)}`,
-        files: bucketFiles,
-      });
-    } else {
-      groups.push(...partitionAt(sourceRoot, bucketFiles, maxFiles, depth + 1));
-    }
-  }
-  return groups;
-}
-
-function chunkFiles(label: string, files: string[], maxFiles: number): SourceGroup[] {
-  const groups: SourceGroup[] = [];
-  for (let index = 0; index < files.length; index += maxFiles) {
-    const part = Math.floor(index / maxFiles) + 1;
-    groups.push({
-      label: files.length <= maxFiles ? label : `${label}#${part}`,
-      files: files.slice(index, index + maxFiles),
-    });
-  }
-  return groups;
-}
-
-function currentLabel(sourceRoot: string, files: string[], depth: number): string {
-  if (depth === 0) {
-    return sourceRoot;
-  }
-  const first = files[0];
-  if (first === undefined) {
-    return sourceRoot;
-  }
-  const parts = first
-    .slice(sourceRoot.length + 1)
-    .split("/")
-    .slice(0, depth);
-  return parts.length === 0 ? sourceRoot : `${sourceRoot}/${parts.join("/")}`;
-}
-
-function commonLabel(sourceRoot: string, files: string[], depth: number): string {
-  if (depth === 0) {
-    if (sourceRoot === "tests") {
-      return sourceRoot;
-    }
-    const first = files[0];
-    return files.length === 1 && first !== undefined && !first.startsWith(`${sourceRoot}/`)
-      ? first
-      : sourceRoot;
-  }
-  if (files.length === 1) {
-    return files[0] ?? sourceRoot;
-  }
-  return currentLabel(sourceRoot, files, depth);
-}
-
-function bucketPrefix(files: string[], sourceRoot: string, depth: number, segment: string): string {
-  const first = files[0];
-  if (first === undefined || depth === 0) {
-    return segment;
-  }
-  const parts = first
-    .slice(sourceRoot.length + 1)
-    .split("/")
-    .slice(0, depth);
-  return [...parts, segment].join("/");
 }
 
 function associatedTests(files: string[], tests: string[], command: string | null): SeedTestRef[] {
@@ -967,7 +2220,9 @@ function isPythonTestPath(path: string): boolean {
 function pythonShouldSkip(path: string): boolean {
   return (
     shouldSkip(path) ||
-    /(^|\/)(\.venv|venv|__pycache__|\.mypy_cache|\.ruff_cache|\.pytest_cache)(\/|$)/u.test(path)
+    /(^|\/)(\.venv(?:-[^/]+)?|venv|__pycache__|\.mypy_cache|\.ruff_cache|\.pytest_cache)(\/|$)/u.test(
+      path,
+    )
   );
 }
 
