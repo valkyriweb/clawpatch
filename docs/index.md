@@ -1,7 +1,7 @@
 ---
 title: Overview
 permalink: /
-description: "clawpatch is an automated code review tool that maps repos into semantic feature slices, reviews each with AI providers, persists findings, and can land fixes."
+description: "clawpatch is an automated code review tool that maps repos into semantic feature slices, reviews each with AI providers, persists findings, and creates explicit repair patches and PRs."
 ---
 
 ## Try it
@@ -30,12 +30,12 @@ stderr so pipes stay parseable.
 
 ## What clawpatch does
 
-- **Semantic feature mapping.** Detects npm bins, Next.js routes, Python packages and Flask routes, Go packages, Rust crates, SwiftPM targets, and common config files as reviewable slices.
-- **Automated code review.** Reviews features with AI providers (Codex CLI today), persists findings with severity, category, and line locations.
+- **Semantic feature mapping.** Detects npm bins, Next.js routes, React Router routes, Python packages and Flask/FastAPI/Django routes, Ruby/Rails slices, Laravel/PHP slices, Java/Kotlin Gradle and Maven modules, C#/.NET projects and ASP.NET endpoints, Go packages, Rust crates, C/C++ build targets, SwiftPM targets, and common config files as reviewable units.
+- **Automated code review.** Reviews features through installed coding harnesses, persists findings with severity, category, and line locations.
 - **Explicit fix workflow.** `clawpatch fix` runs validated patches for one finding at a time, never commits or pushes automatically.
 - **Stable state model.** All features, findings, patches live in `.clawpatch/` as JSON, resumable across runs.
 - **Safety first.** Review is read-only, fix refuses dirty worktrees, never auto-commits, validates before accepting patches.
-- **Multi-language.** JavaScript/TypeScript, Python, Go, Rust, Swift today; more mappers planned.
+- **Multi-language.** JavaScript/TypeScript, Python, Ruby, PHP/Laravel, Java/Kotlin, C#/.NET, Go, Rust, C/C++, and Swift today; more mappers planned.
 
 ## Pick your path
 
@@ -44,7 +44,8 @@ stderr so pipes stay parseable.
 - **Running reviews.** [Code Review](code-review.md) covers provider integration, parallel execution, and finding categories.
 - **Fixing findings.** [Patching](patching.md) documents the explicit fix workflow and validation steps.
 - **Reading reports.** [Reporting](reporting.md) shows how to generate Markdown reports and filter by severity.
-- **Configuring providers.** [Providers](providers.md) lists supported backends and future provider integration plans.
+- **Configuring providers.** [Providers](providers.md) lists supported harnesses and their permission and authentication boundaries.
+- **Understanding project scope.** [Vision](https://github.com/openclaw/clawpatch/blob/main/VISION.md) defines the coding-harness-only provider boundary.
 
 ## All features
 
@@ -59,9 +60,10 @@ stderr so pipes stay parseable.
 - [Validation](validation.md)
 - [Providers](providers.md)
 - [Safety](safety.md)
+- [Release Prep](release-prep.md)
 - [E2E with Gitcrawl](e2e-gitcrawl.md)
 - [Initialization](initialization.md)
 
 ## Project
 
-Active development; the [changelog](https://github.com/openclaw/clawpatch/blob/main/CHANGELOG.md) tracks recent releases. Goals and implementation details in [spec.md](spec.md). Released under the [MIT license](https://github.com/openclaw/clawpatch/blob/main/LICENSE).
+Active development; the [changelog](https://github.com/openclaw/clawpatch/blob/main/CHANGELOG.md) tracks recent releases. Product scope lives in [VISION.md](https://github.com/openclaw/clawpatch/blob/main/VISION.md), with implementation details in [spec.md](spec.md). Released under the [MIT license](https://github.com/openclaw/clawpatch/blob/main/LICENSE).

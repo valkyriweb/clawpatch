@@ -1,0 +1,374 @@
+import { open, realpath, stat } from "node:fs/promises";
+import jsTokens, { type Token } from "js-tokens";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { ClawpatchError } from "./errors.js";
+import { pathMatchesFilters, walk, type PathFilters } from "./mappers/shared.js";
+import type { FeatureRecord } from "./types.js";
+
+export type HttpRelation = {
+  method: string;
+  path: string;
+  caller: { file: string; line: number; featureIds: string[] };
+  handler: { file: string; line: number; featureIds: string[] };
+};
+export type HttpRelations = {
+  relations: HttpRelation[];
+  omitted: number;
+  skippedReason: string | null;
+};
+type Endpoint = { method: string; path: string; file: string; line: number };
+const sourceLimit = 256_000;
+const maxFiles = 500;
+const totalLimit = 8_000_000;
+const counterpartLimit = 3;
+const methods = "get|post|put|patch|delete|head|options";
+const methodNames = new Set(methods.toUpperCase().split("|"));
+const fetchNormalizedMethods = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+
+export function httpRoots(value: string): [string, string] {
+  const parts = value.split(":");
+  if (
+    parts.length !== 2 ||
+    parts.some(
+      (part) =>
+        !part ||
+        part.split("/").some((p) => !p || p === "." || p === "..") ||
+        /[\\]/u.test(part) ||
+        isAbsolute(part),
+    )
+  ) {
+    throw new ClawpatchError(
+      "--link-http requires caller:backend repository-relative directory roots",
+      2,
+      "invalid-usage",
+    );
+  }
+  const [caller, handler] = parts as [string, string];
+  if (within(caller, handler) || within(handler, caller)) {
+    throw new ClawpatchError("--link-http roots must not overlap", 2, "invalid-usage");
+  }
+  return [caller, handler];
+}
+
+export async function findHttpRelations(
+  root: string,
+  features: FeatureRecord[],
+  value: string,
+  filters: PathFilters,
+): Promise<HttpRelations> {
+  const [callerRoot, handlerRoot] = httpRoots(value);
+  const realRoot = await realpath(root);
+  const canonicalRoots: string[] = [];
+  for (const scope of [callerRoot, handlerRoot]) {
+    const full = resolve(root, scope);
+    const actual = await realpath(full).catch(() => null);
+    if (actual === null || !inside(realRoot, actual) || !(await stat(actual)).isDirectory()) {
+      throw new ClawpatchError(`invalid HTTP relation root: ${scope}`, 2, "invalid-usage");
+    }
+    canonicalRoots.push(actual);
+  }
+  if (
+    inside(canonicalRoots[0]!, canonicalRoots[1]!) ||
+    inside(canonicalRoots[1]!, canonicalRoots[0]!)
+  ) {
+    throw new ClawpatchError("--link-http roots must not overlap", 2, "invalid-usage");
+  }
+  const files = (await walk(root, [callerRoot, handlerRoot]))
+    .filter(
+      (file) =>
+        pathMatchesFilters(file, filters) &&
+        ((within(file, callerRoot) && /\.[cm]?[jt]s$/u.test(file)) ||
+          (within(file, handlerRoot) && file.endsWith(".rs"))),
+    )
+    .toSorted();
+  if (files.length > maxFiles) return skipped("HTTP relation scan exceeds 500 source files");
+  const callers: Endpoint[] = [];
+  const handlers: Endpoint[] = [];
+  let bytes = 0;
+  for (const file of files) {
+    const full = resolve(root, file);
+    const actual = await realpath(full).catch(() => null);
+    if (actual === null || !inside(realRoot, actual))
+      return skipped("HTTP relation source is missing or outside the repository");
+    const handle = await open(actual, "r");
+    let source: string;
+    try {
+      const buffer = Buffer.alloc(sourceLimit + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const read = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (read.bytesRead === 0) break;
+        bytesRead += read.bytesRead;
+      }
+      bytes += bytesRead;
+      if (bytesRead > sourceLimit || bytes > totalLimit)
+        return skipped("HTTP relation scan exceeds its source byte budget");
+      source = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    if (within(file, callerRoot) && !file.endsWith(".rs"))
+      callers.push(...httpEndpoints(source, file, "caller"));
+    if (within(file, handlerRoot) && file.endsWith(".rs")) {
+      // Mounting changes route paths; do not guess prefixes from local declarations.
+      if (hasRouteMount(source))
+        return skipped("HTTP backend has unresolved scope or mount prefixes");
+      handlers.push(...httpEndpoints(source, file, "handler"));
+    }
+  }
+  const ownersByFile = new Map<string, Set<string>>();
+  for (const feature of features) {
+    if (feature.status === "skipped") continue;
+    for (const ref of feature.ownedFiles) {
+      const ids = ownersByFile.get(ref.path) ?? new Set<string>();
+      ids.add(feature.featureId);
+      ownersByFile.set(ref.path, ids);
+    }
+  }
+  const ownerIds = new Map([...ownersByFile].map(([file, ids]) => [file, [...ids].toSorted()]));
+  // Once a route is ambiguous, retaining more endpoints only wastes work.
+  const byRoute = new Map<string, Endpoint | null>();
+  for (const handler of handlers) {
+    const key = `${handler.method} ${handler.path}`;
+    byRoute.set(key, byRoute.has(key) ? null : handler);
+  }
+  const relations: HttpRelation[] = [];
+  const seen = new Set<string>();
+  let omitted = 0;
+  for (const caller of callers) {
+    const handler = byRoute.get(`${caller.method} ${caller.path}`);
+    if (handler === undefined || handler === null) continue;
+    const callerIds = ownerIds.get(caller.file) ?? [];
+    const handlerIds = ownerIds.get(handler.file) ?? [];
+    if (!callerIds.length || !handlerIds.length) continue;
+    const key = `${caller.file}:${caller.method}:${caller.path}:${handler.file}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (relations.length >= 200) {
+      omitted += 1;
+      continue;
+    }
+    relations.push({
+      method: caller.method,
+      path: caller.path,
+      caller: { file: caller.file, line: caller.line, featureIds: callerIds },
+      handler: { file: handler.file, line: handler.line, featureIds: handlerIds },
+    });
+  }
+  return { relations, omitted, skippedReason: null };
+}
+
+function hasRouteMount(source: string): boolean {
+  const tokens = codeSource(source, rustCodeMask(source));
+  return (
+    /\bweb\s*::\s*scope\s*(?:\(|::\s*<)/u.test(tokens) || /\.\s*mount\s*(?:\(|::\s*<)/u.test(tokens)
+  );
+}
+
+function codeSource(source: string, mask: Uint8Array): string {
+  return source
+    .split("")
+    .map((char, index) => (mask[index] === 1 ? char : " "))
+    .join("");
+}
+
+export function withHttpContext(feature: FeatureRecord, relations: HttpRelation[]): FeatureRecord {
+  const refs = new Map<string, string>();
+  for (const relation of relations) {
+    const counterpart = relation.caller.featureIds.includes(feature.featureId)
+      ? relation.handler
+      : relation.handler.featureIds.includes(feature.featureId)
+        ? relation.caller
+        : null;
+    if (counterpart !== null)
+      refs.set(
+        counterpart.file,
+        `candidate HTTP ${relation.method} ${relation.path}; verify runtime routing`,
+      );
+  }
+  return {
+    ...feature,
+    contextFiles: [
+      ...feature.contextFiles,
+      ...[...refs].slice(0, counterpartLimit).map(([path, reason]) => ({ path, reason })),
+    ],
+  };
+}
+
+export function httpEndpoints(
+  source: string,
+  file: string,
+  role: "caller" | "handler",
+): Endpoint[] {
+  if (role === "caller") return /\.[jt]sx$/u.test(file) ? [] : javascriptEndpoints(source, file);
+  const code = rustCodeMask(source);
+  const pattern = new RegExp(
+    String.raw`#\[\s*(${methods})\s*\(\s*"(\/[^"\\\r\n]*)"\s*\)\s*\]`,
+    "gu",
+  );
+  const endpoints: Endpoint[] = [];
+  let line = 1;
+  let lineCursor = 0;
+  for (const match of source.matchAll(pattern)) {
+    while (lineCursor < match.index) {
+      if (source[lineCursor++] === "\n") line += 1;
+    }
+    if (code[match.index] && isHttpPath(match[2]!))
+      endpoints.push({ method: match[1]!.toUpperCase(), path: match[2]!, file, line });
+  }
+  return endpoints;
+}
+
+type LocatedToken = { token: Token; line: number; inTemplate: boolean };
+
+function javascriptEndpoints(source: string, file: string): Endpoint[] {
+  const tokens: LocatedToken[] = [];
+  let line = 1;
+  let templateDepth = 0;
+  try {
+    for (const token of jsTokens(source)) {
+      if (token.type === "TemplateHead") templateDepth += 1;
+      if (
+        token.type !== "WhiteSpace" &&
+        token.type !== "LineTerminatorSequence" &&
+        !token.type.endsWith("Comment")
+      )
+        tokens.push({ token, line, inTemplate: templateDepth > 0 });
+      if (token.type === "TemplateTail") templateDepth -= 1;
+      for (const char of token.value) if (char === "\n") line += 1;
+    }
+  } catch (error) {
+    // Do not emit partial relations if the tokenizer exceeds its own limits.
+    if (error instanceof RangeError) return [];
+    throw error;
+  }
+  const endpoints: Endpoint[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const current = tokens[index]!;
+    if (
+      current.inTemplate ||
+      current.token.type !== "IdentifierName" ||
+      current.token.value !== "fetch"
+    )
+      continue;
+    const previous = tokens[index - 1]?.token.value;
+    if (previous === "." || previous === "?.") continue;
+    const call = literalFetchCall(tokens, index);
+    if (call !== null) endpoints.push({ ...call, file, line: current.line });
+  }
+  return endpoints;
+}
+
+function literalFetchCall(
+  tokens: LocatedToken[],
+  start: number,
+): { method: string; path: string } | null {
+  let index = start + 1;
+  if (tokens[index++]?.token.value !== "(") return null;
+  const path = unescapedString(tokens[index++]?.token);
+  if (path === null || !isHttpPath(path)) return null;
+  let method = "GET";
+  if (tokens[index]?.token.value === ",") {
+    index += 1;
+    if (tokens[index]?.token.value !== ")") {
+      if (tokens[index++]?.token.value !== "{") return null;
+      const key = tokens[index++]?.token;
+      if (
+        !(key?.type === "IdentifierName" && key.value === "method") &&
+        unescapedString(key) !== "method"
+      )
+        return null;
+      if (tokens[index++]?.token.value !== ":") return null;
+      const raw = unescapedString(tokens[index++]?.token);
+      if (raw === null) return null;
+      const upper = raw.toUpperCase();
+      // Fetch normalizes these six verbs; PATCH remains case-sensitive.
+      const value = fetchNormalizedMethods.has(upper) ? upper : raw;
+      if (!methodNames.has(value)) return null;
+      method = value;
+      if (tokens[index]?.token.value === ",") index += 1;
+      if (tokens[index++]?.token.value !== "}") return null;
+      if (tokens[index]?.token.value === ",") index += 1;
+    }
+  }
+  return tokens[index]?.token.value === ")" ? { method, path } : null;
+}
+
+function unescapedString(token: Token | undefined): string | null {
+  return token?.type === "StringLiteral" && token.closed && !token.value.includes("\\")
+    ? token.value.slice(1, -1)
+    : null;
+}
+
+function isHttpPath(path: string): boolean {
+  return (
+    path.startsWith("/") &&
+    !path.startsWith("//") &&
+    !/[?#*{}<>\s]/u.test(path) &&
+    !path.split("/").some((part) => part === "." || part === ".." || part.startsWith(":"))
+  );
+}
+
+function rustCodeMask(source: string): Uint8Array {
+  const mask = new Uint8Array(source.length);
+  let i = 0;
+  while (i < source.length) {
+    if (source.startsWith("//", i)) {
+      const end = source.indexOf("\n", i);
+      i = end < 0 ? source.length : end;
+      continue;
+    }
+    if (source.startsWith("/*", i)) {
+      let depth = 1;
+      i += 2;
+      while (i < source.length && depth) {
+        if (source.startsWith("/*", i)) {
+          depth += 1;
+          i += 2;
+        } else if (source.startsWith("*/", i)) {
+          depth -= 1;
+          i += 2;
+        } else i += 1;
+      }
+      continue;
+    }
+    const raw = /^r(#+)?"/u.exec(source.slice(i));
+    if (raw !== null) {
+      const end = source.indexOf(`"${raw[1] ?? ""}`, i + raw[0].length);
+      i = end < 0 ? source.length : end + 1 + (raw[1]?.length ?? 0);
+      continue;
+    }
+    const char = source[i]!;
+    // Rust lifetimes are identifiers, not unterminated character literals.
+    if (
+      char === "'" &&
+      /^'[A-Za-z_]\w*(?![\w'])/u.test(source.slice(i)) &&
+      !/^'[^'\n]+'/u.test(source.slice(i))
+    ) {
+      mask[i++] = 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") i += 2;
+        else if (source[i++] === char) break;
+      }
+      continue;
+    }
+    mask[i++] = 1;
+  }
+  return mask;
+}
+
+function within(file: string, scope: string): boolean {
+  return file === scope || file.startsWith(`${scope}/`);
+}
+function inside(root: string, file: string): boolean {
+  const path = relative(root, file);
+  return !isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`);
+}
+
+function skipped(skippedReason: string): HttpRelations {
+  return { relations: [], omitted: 0, skippedReason };
+}
