@@ -111,6 +111,11 @@
       * {
         box-sizing: border-box;
       }
+
+      [hidden] {
+        display: none !important;
+      }
+
       html {
         scroll-behavior: smooth;
         scroll-padding-top: 24px;
@@ -404,6 +409,12 @@
       .search input:focus {
         border-color: var(--accent);
         box-shadow: 0 0 0 4px var(--accent-soft);
+      }
+
+      .search-empty {
+        color: var(--muted);
+        font-size: 0.85rem;
+        margin: -12px 0 20px;
       }
 
       nav section {
@@ -780,6 +791,46 @@
           height: auto;
           transform: none;
           box-shadow: none;
+          padding: 18px 20px;
+        }
+
+        .sidebar-head {
+          margin-bottom: 14px;
+        }
+
+        .search {
+          margin-bottom: 14px;
+        }
+
+        .search-empty {
+          margin: -4px 0 12px;
+        }
+
+        nav {
+          display: flex;
+          gap: 8px;
+          margin: 0 -20px;
+          overflow-x: auto;
+          padding: 0 20px 4px;
+          scrollbar-width: thin;
+        }
+
+        nav section {
+          display: flex;
+          flex: 0 0 auto;
+          gap: 8px;
+          margin: 0;
+        }
+
+        nav h2 {
+          display: none;
+        }
+
+        .nav-link {
+          background: var(--paper);
+          border: 1px solid var(--line);
+          flex: 0 0 auto;
+          white-space: nowrap;
         }
 
         main {
@@ -971,6 +1022,7 @@
           <span>Search</span>
           <input id="doc-search" type="search" placeholder="init, review, fix" />
         </label>
+        <p id="search-empty" class="search-empty" hidden>No matching sections.</p>
         <nav>
           <section>
             <h2>Getting Started</h2>
@@ -1005,7 +1057,7 @@
       <main>
         <header class="home-hero">
           <p class="eyebrow">Automated Code Review · Explicit Fixes</p>
-          <h1>Code review with<br />explicit fixes</h1>
+          <h1>Code review with <br />explicit fixes</h1>
           <p class="lede">
             Clawpatch maps codebases into semantic feature slices, reviews them for bugs and quality
             issues, and records explicit fix attempts with validation.
@@ -1331,7 +1383,7 @@
             <li><strong>CI/CD Integration</strong> — Run review and reporting in GitHub Actions</li>
             <li><strong>Custom Mappers</strong> — Support additional frameworks and languages</li>
             <li><strong>Finding Templates</strong> — Create custom review rules</li>
-            <li><strong>Provider API</strong> — Implement custom AI providers</li>
+            <li><strong>Coding harnesses</strong> — Integrate agent CLIs and ACP adapters</li>
           </ul>
 
           <p class="muted">Made with care by the OpenClaw team. Released under MIT license.</p>
@@ -1393,17 +1445,31 @@
 
       // Search functionality
       const input = document.getElementById("doc-search");
+      const emptyState = document.getElementById("search-empty");
       input?.addEventListener("input", () => {
         const q = input.value.trim().toLowerCase();
+        let anyResult = false;
         document.querySelectorAll("nav section").forEach((sec) => {
+          const sectionLabel = sec.querySelector("h2")?.textContent?.toLowerCase() || "";
           let any = false;
           sec.querySelectorAll(".nav-link").forEach((a) => {
-            const m = !q || a.textContent.toLowerCase().includes(q);
-            a.style.display = m ? "block" : "none";
+            const haystack = [
+              a.textContent,
+              a.getAttribute("href"),
+              a.getAttribute("aria-label"),
+              sectionLabel,
+            ]
+              .filter(Boolean)
+              .join(" ")
+              .toLowerCase();
+            const m = !q || haystack.includes(q);
+            a.hidden = !m;
             if (m) any = true;
           });
-          sec.style.display = any ? "block" : "none";
+          sec.hidden = !any;
+          if (any) anyResult = true;
         });
+        if (emptyState) emptyState.hidden = anyResult || !q;
       });
     </script>
   </body>

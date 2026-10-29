@@ -1,24 +1,216 @@
 # Changelog
 
-## Unreleased
+## 0.8.5 - Unreleased
 
-- Added security ownership, CodeQL, Dependabot, dependency review, and a private disclosure policy for repository automation and package integrity, plus fixed the first CodeQL mapper sanitizer finding.
-- Added JVM semantic role mapping from Java annotations, imports, inheritance, interfaces, and method signatures.
-- Added Ruby and Rails feature mapping while excluding legacy Rails secrets from reviewable config.
-- Fixed Ruby/Rails project detection so `gems.rb` uses Bundler commands and Rails JavaScript roots avoid duplicate Node feature queues.
-- Improved Python mapping for `setup.cfg`/`setup.py` project metadata and console scripts, plus `black --check .` format defaults.
-- Added selected package script mapping for Node workspace packages.
-- Detected Java/Kotlin language and default Gradle build/test commands for root Gradle projects.
-- Added FastAPI route feature mapping and kept root/web Python project detection in sync.
+## 0.8.4 - 2026-10-21
+
+**Highlights:** Package-less nested TypeScript sources receive deterministic ownership without crossing explicit project boundaries.
+
+- Fixed deterministic mapping of package-less nested Node/TypeScript sources under `packages/*`, assigning unowned files to bounded source groups while preserving explicit project boundaries, thanks @ptahdunbar for the report (#243).
+
+## 0.8.3 - 2026-10-20
+
+**Highlights:** Provider JSON recovery handles unmatched braces in prose, and the coverage toolchain receives a Source Map JS security fix.
+
+- Fixed provider JSON extraction to recover structured results after unmatched braces in leading prose, thanks @goutamadwant and @notlakshitha.
+- Updated the coverage toolchain's Source Map JS dependency to 1.2.2 to fix an indexed source-map denial of service (GHSA-68fv-2mgg-jv7q).
+- Updated Vite to 8.3.4, pnpm to 11.28.6, and the release workflow's npm CLI to 12.2.0 within the 48-hour dependency release-age policy.
+- Updated Zod to 4.6.7, Vitest and V8 coverage to 5.0.5, Oxfmt to 0.73.0, Oxlint to 1.88.0, and CodeQL to 4.39.0 within the 48-hour dependency release-age policy, thanks @dependabot[bot].
+- Added a no-publish release workflow dry run that validates the selected ref and defaults on for manual dispatch.
+- Updated Node setup to 7.1.0, CodeQL to 4.38.3, and both the TruffleHog action and scanner to 3.99.2, thanks @dependabot[bot].
+- Updated Oxfmt to 0.72.0 and Oxlint to 1.87.0 for repository formatting and linting, thanks @dependabot[bot].
+- Updated Node 22 typings to 22.20.5, Vitest and V8 coverage to 5.0.3, Vite to 8.3.2, and pnpm to 11.28.4 within the 48-hour dependency release-age policy, thanks @dependabot[bot].
+
+## 0.8.2 - 2026-10-01
+
+**Highlights:** Diff-scoped reviews retain both sides of committed renames, and patch audits preserve symlink and literal-path edits.
+
+- Fixed diff-scoped review, CI, and revalidation to include both paths of committed renames, preventing features mapped to the old path from being silently skipped.
+- Fixed non-Git patch audits to retain symlink edits and literal backslashes in Unix filenames without reading linked targets.
+- Updated Oxfmt to 0.71.0, Oxlint to 1.86.0, pnpm to 11.28.2, Vite to 8.3.1, and the release workflow's npm CLI to 12.1.0 within the 48-hour dependency release-age policy.
+- Updated Vitest and V8 coverage to 5.0.2, pnpm to 11.28.0, CodeQL to 4.38.2, and both the TruffleHog action and scanner to 3.97.9, thanks @dependabot[bot].
+
+## 0.8.1 - 2026-09-13
+
+**Highlights:** Nested-project repairs stop tripping over sibling changes, and failed patch attempts keep the edits a provider already wrote.
+
+- Fixed nested-project repairs to ignore their own state and sibling changes, fingerprint project-relative source paths, and record both sides of renames.
+- Preserved observed source edits in failed patch attempts when a provider writes files before exiting with an error.
+- Fixed `doctor` to honor standalone provider configuration before project initialization.
+- Prevented oversized provider, validation, and PR-publishing timeout overrides from overflowing into one-millisecond deadlines.
+- Rejected inherited object-property names as unsupported providers instead of failing during harness invocation.
+- Completed Vitest 5 tooling with matching V8 coverage, a full-suite CI coverage run, ignored report artifacts, and documented development Node requirements while retaining Node 22/24/26 CI and the CLI's Node 22 floor.
+- Updated Nano ID to 3.3.19, Magic String to 1.3.1, and Obug to 2.2.1 within the 48-hour dependency release-age policy.
+- Updated Zod and development tooling, aligned Node typings with the Node 22 floor, and added Node 22/24 runtime CI with pinned GitHub Actions.
+- Updated workflow and architecture docs to match current providers, explicit PR creation, validation order, and stale-lock recovery.
+
+## 0.8.0 - 2026-09-07
+
+**Highlights:** Opt-in HTTP context connects Node callers and Rust handlers during review.
+
+- Added `map --link-http caller:backend` and `review --link-http caller:backend` for bounded, method-aware HTTP candidate context, with ambiguity checks and unchanged default feature records, thanks @Tanmay-008.
+- Fixed source packaging with pnpm 12 by using the portable `pnpm run build` prepack command.
+- Updated the pnpm GitHub Actions setup to 6.1.0.
+- Added shared-host scheduling headroom to timeout regression tests while retaining explicit bounded-return checks.
+
+## 0.7.3 - 2026-09-05
+
+**Highlights:** Broader Rust module coverage and bounded timeouts for Go discovery and pull-request publishing.
+
+- Added bounded Rust source-group slices under each Cargo package's `src/`, keeping command, library, and binary entrypoints on their existing features, thanks @joshuaboys.
+- Fixed `clawpatch open-pr` so a stalled `git push` or `gh pr create` times out instead of hanging the command, thanks @SebTardif.
+- Fixed Windows command timeouts so a hung `taskkill` cannot keep the CLI or its direct child running after the cleanup deadline, thanks @SebTardif.
+- Fixed Windows shell validation commands with quoted executable paths.
+- Fixed `clawpatch map` so a wedged `go list` times out and falls back to repository files, thanks @SebTardif.
+- Reworked the README around a verified install and quickstart path, with deeper command, mapper, provider, and safety details linked to the existing docs.
+- Updated Zod to 4.5.4 for lower-memory runtime schema validation.
+- Updated pnpm, Node typings, formatter and linter tooling, Vitest 5/Vite, GitHub Actions dependencies, and the release workflow's npm CLI.
+- Bound npm trusted publishing to the `npm-release` GitHub environment and restored canonical package repository metadata.
+
+## 0.7.2 - 2026-08-01
+
+- Reclaimed dead same-host review locks automatically and added `clean-locks --stale-only` for safe scripted cleanup while preserving live and remote locks, thanks @goutamadwant.
+- Fixed diff-scoped review and CI runs to include changed features regardless of their previous review status, preventing warm-state gates from silently skipping changed code, thanks @youhaowei.
+- Updated pnpm, Node typings, formatter and linter tooling, and security and repository automation actions.
+- Added Rust seed context for Cargo manifests, paired crate entrypoints, and directly declared modules across crate roots and binary layouts, thanks @Tanmay-008.
+
+## 0.7.1 - 2026-07-20
+
+### Highlights
+
+- Reduced mapper startup I/O by sharing one root file inventory across Go fallback, C/C++, and .NET mapping, thanks @Tanmay-008.
+- Fixed revalidation prompts to compact historical and feature metadata and hard-cap metadata lists even when configured file limits are high, preventing provider input overflows, thanks @pai-scaffolde.
+- Added an opt-in Claude host auth context that preserves the default-deny environment, uses Claude Code safe mode, validates auth through doctor, and reports redacted OAuth failure signals, thanks @grantjayy.
+
+## 0.7.0 - 2026-06-15
+
+- Removed the direct MiniMax HTTP provider and its transport dependency; provider integrations are now explicitly limited to coding harnesses and agent CLIs.
+- Added uv workspace member mapping with repository-relative paths and member-local test commands while preserving mixed root source and test groups, thanks @srnm.
+- Fixed uv workspace mapping to preserve root features with member-associated tests and include workspace-root runtime metadata in member features, thanks @srnm.
+
+## 0.6.0 - 2026-06-11
+
+- Added trusted Codex CLI config passthrough for explicit config files while rejecting repository-controlled passthrough config, thanks @brad-ai-agent.
+- Added a MiniMax HTTP provider for `map`, `review`, and `revalidate`, with local schema validation and explicit unsupported `fix` handling, thanks @ferminquant.
+
+## 0.5.1 - 2026-06-10
+
+- Added npm trusted publishing through GitHub Actions OIDC, plus secops ownership, verified-secret scanning, and stale issue and pull request automation.
+- Added opt-in npm registry verification that drops only matching single-package, whole-title-and-reasoning public-npm publication claims when the exact version is confirmed published, thanks @coletebou.
+- Fixed revalidation to include linked patch attempts, validation results, feature context, and current relevant files so repaired findings can move out of `uncertain`.
+- Added `clawpatch review --feature-list <path>` for reviewing an explicit ordered, de-duplicated set of feature IDs, thanks @camwest.
+
+## 0.5.0 - 2026-05-31
+
+- Added CUDA support to the C/C++ mapper, mapping `.cu` and `.cuh` sources as standalone `main()` files, CMake and autotools targets, legacy `FindCUDA` `cuda_add_executable` / `cuda_add_library` calls, and bounded loose source groups.
+- Made `clawpatch review` and `clawpatch fix` CUDA-aware, injecting CUDA-specific guidance for features that own `.cu` or `.cuh` sources.
+- Added shell and workflow review mapping for captured fallback-output ambiguity in command substitutions.
+- Fixed Codex provider calls to time out stalled `codex exec` children and release review locks, thanks @camwest.
+- Fixed Claude provider auth isolation to pass explicit Vertex AI, Google ADC, and Bedrock/AWS auth environment variables, thanks @zanetworker.
+- Fixed Python review prompts to include target runtime metadata and avoid flagging Python 3.14 syntax such as PEP 758 exception handlers as invalid, thanks @rohitjavvadi.
+- Fixed mapper-generated validation commands to quote repository-derived paths, package names, script names, and test paths before shell execution, thanks @rohitjavvadi.
+
+## 0.4.0 - 2026-05-22
+
+- Added `clawpatch ci` to initialize, map, review, write a report, and append a GitHub Actions step summary in one CI-friendly command.
+- Added `clawpatch open-pr --patch <id>` to turn an applied patch attempt into an explicit GitHub pull request.
+- Added a `claude` provider for routing map, review, fix, and revalidate through the local Claude Code CLI in print mode, thanks @aurokin.
+- Added an experimental `cursor` provider for local Cursor Agent CLI review workflows behind explicit opt-in gates, thanks @aurokin.
+- Added review prompt provenance and budget accounting for included files, omitted files, prompt bytes, and approximate tokens.
+- Added retries for transient acpx JSON review failures via `--prompt-retries` and `CLAWPATCH_REVIEW_RETRIES`, thanks @coletebou.
+- Hardened review ingestion so provider findings must cite included files with valid line ranges and matching evidence quotes.
+- Fixed provider review to preserve valid sibling findings when per-finding schema or evidence validation fails, recording drops in `run.errors` as non-fatal `schema-drop` or `validation-drop` entries, thanks @coletebou.
+- Improved provider schema validation failures so `run.errors[].message` shows compact one-line Zod issue summaries, thanks @coletebou.
+- Added `total` and `results` aliases on `clawpatch report --json` output while keeping the legacy `findings` count, thanks @coletebou.
+- Fixed `clawpatch open-pr` so repositories without default-branch metadata use a dedicated patch branch and let GitHub choose the PR base.
+- Fixed `clawpatch open-pr` retries to push the recorded patch commit instead of any later local branch tip.
+- Fixed first-time `clawpatch open-pr` branch creation to start from the recorded patch base.
+- Fixed command execution so providers that exit before reading stdin do not surface benign `EPIPE` errors.
+- Fixed `clawpatch ci --since` empty-review output so it reports `reviewed: 0`.
+- Fixed formatter configuration so `oxfmt` uses two-space indentation consistently across platforms.
+- Added generic package-less monorepo app-root mapping for Node/Next projects under roots such as `apps/*` and `packages/*` when positive source or framework signals are present.
+- Added Maven project mapping for root, nested, and multi-module Java/Kotlin projects with Spring role slices, Maven validation defaults, and `pom.xml` detection, thanks @julianshess.
+- Added a release-prep checklist for auditing changelog, package metadata, and dry-run package contents without publishing.
+- Improved bounded source grouping so large flat directories split repeated filename families like command, plugin, doctor, and runtime files into more coherent review slices.
+- Fixed acpx provider error reporting by reading the terminal `result.stopReason` envelope and surfacing non-`end_turn` reasons as typed `ClawpatchError` codes (`agent-cancelled`, `agent-refused`, `agent-truncated`) instead of opaque `malformed-output`, thanks @coletebou.
+- Added website crawler artifacts and a static smoke check for metadata, anchors, and social-card dimensions, thanks @zack-dev-cm.
+- Improved OpenCode malformed JSON diagnostics with output length, event kinds, and a bounded preview, thanks @rohitjavvadi.
+- Fixed finding signatures so equivalent evidence remains stable across re-reviews, thanks @rohitjavvadi.
+- Fixed provider exit-code classification for stdout-only authentication and quota failures, thanks @rohitjavvadi.
+- Improved Node route mapping to preserve literal Express and Hono mount prefixes, thanks @rohitjavvadi.
+- Improved Flask route mapping to preserve static blueprint URL prefixes, thanks @rohitjavvadi.
+- Improved Django route mapping to preserve literal `include()` route prefixes, thanks @rohitjavvadi.
+- Added conservative Rails route mapping for literal root and HTTP verb routes, thanks @rohitjavvadi.
+- Fixed heuristic feature mapping to honor configured path include/exclude filters, thanks @schedawg74.
+- Fixed Express route mapping for aliased Router imports that follow block comment banners, thanks @rohitjavvadi.
+- Fixed Laravel route mapping to include array-style `Route::group` prefixes, thanks @rohitjavvadi.
+- Fixed Fastify route-object mapping to emit static method arrays while ignoring dynamic entries, thanks @rohitjavvadi.
+- Fixed Fastify plugin callback route mapping for typed parameters and plugin aliases, thanks @rohitjavvadi.
+- Fixed FastAPI route mapping to include static `APIRouter(prefix=...)` values, thanks @AsishKumarDalal.
+- Added `--include-dirty` to review, CI, and revalidation file filters for auditing uncommitted worktree changes, thanks @AsishKumarDalal.
+- Fixed Bun package-manager detection to recognize the text `bun.lock` lockfile, thanks @austinm911.
+- Fixed review-output schema to tolerate optional `reproduction` and `minimumFixScope` fields and zero-valued evidence line numbers (normalized to `null`), recovering 4 of 28 zod issue patterns observed in run `20260517T190759-3c9e9e` (78 errors over 1000 features) that previously dropped whole-feature output instead of the affected finding.
+- Changed `clawpatch review --jobs` and `clawpatch ci --jobs` defaults from a fixed `10` to `floor(cpuCores / 2)` clamped to `[1, 10]`, thanks @coletebou.
+- Added `clawpatch review --rate-limit-per-minute <n>` (also `CLAWPATCH_RPM`) to cap how many provider calls may start within any rolling 60s window across jobs, thanks @coletebou.
+
+## 0.3.0 - 2026-05-18
+
+- Added a `pi` provider for routing review, fix, revalidate, and agent map through the [pi coding agent](https://pi.dev) in non-interactive print mode, thanks @danielmarbach.
+- Added deslopify review mode and ranked maintainability/performance report clusters for repeated cleanup patterns, thanks @mbelinky.
+- Fixed `clawpatch review --since` to review all touched features by default instead of silently applying the normal single-feature limit.
+- Added `--skip-git-repo-check` for Codex-backed map, review, fix, and revalidate commands so initialized non-Git roots can run Codex, thanks @im-zayan.
+- Added explicit Codex reasoning effort selection via `--reasoning-effort`, `CLAWPATCH_REASONING_EFFORT`, and provider config, with `doctor` reporting the active setting.
+- Added `CLAWPATCH_CODEX_SANDBOX` for overriding Codex provider sandbox mode when the host already provides isolation, thanks @IAMSamuelRodda.
+- Added `clawpatch review --prompt-file` to append extra reviewer guidance from a file or stdin, thanks @dpdanpittman.
+- Added `clawpatch review --export-tribunal-ledger` to emit review findings as JSONL for downstream ledger ingestion, thanks @dpdanpittman.
+- Added deterministic Express, Fastify, and Hono route mapping for Node projects, thanks @rohitjavvadi.
+- Fixed Express route mapping to recognize aliased Router factories from imports, CommonJS destructuring, and direct assignments, thanks @rohitjavvadi.
+- Added conservative Django `urls.py` route mapping for `path`, `re_path`, and legacy `url` declarations, thanks @rohitjavvadi.
+- Added first-pass Elixir Mix/Phoenix mapping for project metadata, contexts, Phoenix web slices, runtime config, Ecto migrations, project scripts, ExUnit tests, and Mix validation defaults, thanks @tears-mysthrala.
+- Improved Kotlin JVM and Android semantic role mapping for Gradle projects, including Android plugin aliases, local type handling, comment/string parsing, and role fallback edges, thanks @mrmans0n.
+- Added C#/.NET detection, conservative `dotnet build` / `dotnet test` defaults, ASP.NET Core route mapping, C#/F#/Visual Basic source groups, and .NET test-project mapping including TUnit, thanks @SimonGuldager with ideas from @danielmarbach.
+- Fixed .NET mapping to avoid including `NuGet.config` in review context and to reject stale or commented solution project entries when choosing validation defaults.
+- Improved Node workspace mapping with richer package overview features, generic extension package context, semantic large-source splits, and stricter generated/build ownership hygiene.
+- Fixed agent mapper inventory to honor Git ignored files, nested worktrees, and configured include/exclude filters, thanks @amiable-dev.
+- Fixed provider commands with relative `--root` paths by canonicalizing explicit roots before invoking Codex or other providers.
+- Improved Codex provider failures for missing Responses API write scope with direct credential and scope guidance.
+- Improved `clawpatch fix` handoff context and patch-attempt changed-file auditing for dirty-worktree fixes.
+- Fixed docs search matching, empty-state display, and mobile sidebar navigation, thanks @cloudsolutiongmbh.
+
+## 0.2.0 - 2026-05-17
+
+- Added the `acpx` provider for routing review, fix, and revalidate through ACP-compatible coding agents, thanks @mvanhorn.
+- Added an OpenCode CLI provider for review, fix, revalidate, and doctor flows, thanks @Ashwinhegde19.
+- Added a Grok CLI provider for review, fix, revalidate, and doctor flows, thanks @ebastos.
+- Added `clawpatch map --source auto|agent` to invoke the configured provider as a read-only agent mapper when deterministic mapping is too shallow.
+- Fixed agent mapping so provider-derived slices augment deterministic slices instead of retiring useful heuristic coverage on large repos.
+- Fixed ACPX provider calls so stalled child agents time out instead of hanging indefinitely.
+- Improved `clawpatch map` progress output and Rust mapping latency by reporting mapper activity on stderr and avoiding repeated Rust test discovery walks, thanks @optozorax.
 - Added `--since <ref>` on `clawpatch review` and `clawpatch revalidate` to restrict runs to features whose owned or context files changed since the given git ref, thanks @mvanhorn.
-- Added Flask route feature mapping for Python projects, including `web/` source roots, common root entry files, non-list method literals, and Python framework detection.
-- Added Next.js route mapping for `src/app` and `src/pages` layouts, thanks @obatried.
-- Added first-pass Python mapping for project metadata, console scripts, source groups, pytest suites, and conservative validation defaults, thanks @xiamx.
-- Added progress output for `clawpatch revalidate`, thanks @twidtwid.
 - Improved Node/TypeScript mapping for large workspaces by splitting package source trees into bounded review groups with package-local tests.
 - Added generic nested SwiftPM, Apple/Xcode, and Gradle/Android app mapping.
-- Fixed Codex provider execution on Windows paths with spaces and npm `.cmd` shims, thanks @1berto.
+- Added React Router and React component mapping, thanks @moritzscheele.
+- Added Next.js route mapping for `src/app` and `src/pages` layouts, thanks @obatried.
+- Added Laravel/PHP feature mapping for routes, controllers, form requests, Artisan commands, jobs, services, models, migrations, seeders, Composer scripts, and PHP tests, thanks @Jonathanm10.
+- Added Ruby and Rails feature mapping while excluding legacy Rails secrets from reviewable config, thanks @inertia186.
+- Added FastAPI route feature mapping and kept root/web Python project detection in sync.
+- Added Flask route feature mapping for Python projects, including `web/` source roots, common root entry files, non-list method literals, and Python framework detection.
+- Added first-pass Python mapping for project metadata, console scripts, source groups, pytest suites, and conservative validation defaults, thanks @xiamx.
+- Improved Python mapping for `setup.cfg`/`setup.py` project metadata and console scripts, plus `black --check .` format defaults.
+- Added Kotlin semantic role mapping for Gradle projects, including Android UI, ViewModel, data, external client, dependency injection, and server-side role slices, thanks @mrmans0n.
+- Added JVM semantic role mapping from Java annotations, imports, inheritance, interfaces, and method signatures.
+- Detected Java/Kotlin language and default Gradle build/test commands for root Gradle projects.
+- Added generic C/C++ feature mapping for standalone `main()` files, CMake `add_executable` / `add_library` targets, and autotools `bin_PROGRAMS` / `lib_LTLIBRARIES` targets, thanks @iliaal.
+- Added Turborepo task metadata mapping for workspace-aware feature validation commands.
+- Added selected package script mapping for Node workspace packages.
+- Added progress output for `clawpatch revalidate`, thanks @twidtwid.
+- Fixed overlapping `clawpatch review` runs so feature claims use atomic lock files and can be recovered with `clean-locks`, thanks @rohitjavvadi.
 - Fixed `clawpatch fix` so feature-specific validation commands run during dry-run previews and applied fix validation, thanks @rohitjavvadi.
+- Fixed Codex provider parsing for Markdown-wrapped JSON output with trailing prose, thanks @pranaysuyash.
+- Fixed Codex provider execution on Windows paths with spaces and npm `.cmd` shims, thanks @1berto.
+- Fixed Ruby/Rails project detection so `gems.rb` uses Bundler commands and Rails JavaScript roots avoid duplicate Node feature queues.
+- Added security ownership, CodeQL, Dependabot, dependency review, and a private disclosure policy for repository automation and package integrity, plus fixed the first CodeQL mapper sanitizer finding.
+- Updated development, GitHub Actions, and Node type dependencies, made dependency review skip cleanly when the GitHub API is unavailable, and fixed CodeQL ReDoS findings in Laravel route parsing.
 
 ## 0.1.0 - 2026-05-15
 

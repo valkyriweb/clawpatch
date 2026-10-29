@@ -1,13 +1,14 @@
+import { stripSwiftComments } from "../source-comments.js";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { pathExists } from "../fs.js";
+import { shellQuotePath } from "../shell.js";
 import {
   normalize,
   isSampleProjectPath,
   packageTrustBoundaries,
   pathMatchesPrefix,
   shouldSkip,
-  stripSwiftComments,
   walk,
 } from "./shared.js";
 import { FeatureSeed, SeedFileRef, SeedTestRef } from "./types.js";
@@ -174,7 +175,9 @@ function prefixSwiftSeed(seed: FeatureSeed, packageRoot: string): FeatureSeed {
   if (packageRoot === ".") {
     return seed;
   }
-  const testCommand = seed.testCommand === null ? null : `swift test --package-path ${packageRoot}`;
+  const quotedPackageRoot = shellQuotePath(packageRoot);
+  const testCommand =
+    seed.testCommand === null ? null : `swift test --package-path ${quotedPackageRoot}`;
   const prefixed: FeatureSeed = {
     ...seed,
     title: `${seed.title} (${packageRoot})`,
@@ -211,10 +214,11 @@ function prefixTestRefs(
   packageRoot: string,
   refs: SeedTestRef[] | undefined,
 ): SeedTestRef[] | undefined {
+  const quotedPackageRoot = shellQuotePath(packageRoot);
   return refs?.map((ref) => ({
     ...ref,
     path: prefixSwiftPath(packageRoot, ref.path),
-    command: ref.command === null ? null : `swift test --package-path ${packageRoot}`,
+    command: ref.command === null ? null : `swift test --package-path ${quotedPackageRoot}`,
   }));
 }
 

@@ -10,7 +10,9 @@ User documentation is in `docs/`; the static website assets are in `website/`.
 
 ## Build, Test, and Development Commands
 
-Use pnpm with Node 22 or newer.
+Use pnpm with Node 22.x (22.13+), 24.x, or 26+ for pnpm 11 and Vitest 5 development. The published
+CLI continues to support Node 22 or newer.
+Keep `@types/node` on the Node 22 major to typecheck against that runtime floor.
 
 - `pnpm build`: clean and compile the package with `tsconfig.build.json`.
 - `pnpm typecheck`: run TypeScript checks without emitting files.
@@ -18,6 +20,7 @@ Use pnpm with Node 22 or newer.
 - `pnpm format`: rewrite files with Oxfmt.
 - `pnpm format:check`: verify formatting without writing changes.
 - `pnpm test`: run the Vitest suite.
+- `pnpm test:coverage`: run the full suite with V8 coverage reports in `coverage/`.
 - `pnpm test src/mapper.test.ts`: run one focused test file.
 
 For local CLI checks, build first, then run `node dist/cli.js <command>`.
