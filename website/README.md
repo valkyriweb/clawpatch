@@ -1,6 +1,6 @@
 # clawpatch Website
 
-Static single-page site for the early `clawpatch` CLI.
+Static single-page site for the `clawpatch` CLI.
 
 Files:
 
@@ -8,6 +8,8 @@ Files:
 - `favicon.svg`: browser icon
 - `social-card.svg`: link preview card
 - `social-card.png`: raster link preview card for Open Graph/Twitter
+- `robots.txt`: crawler policy with sitemap reference
+- `sitemap.xml`: canonical single-page sitemap
 
 Preview:
 
@@ -18,8 +20,8 @@ python3 -m http.server 8000
 
 Keep copy aligned with the implemented CLI:
 
-- provider: local Codex CLI, plus test mocks
-- review: sequential feature review
+- providers: installed coding harnesses listed in [Providers](../docs/providers.md)
+- review: bounded parallel feature reviews
 - fix: `clawpatch fix --finding <id>`
-- no auto-commit, PR creation, or landing yet
-- no direct OpenAI provider yet
+- PR creation: explicit `clawpatch open-pr --patch <id>`; no automatic landing
+- provider integrations use coding harnesses, which own model API access
