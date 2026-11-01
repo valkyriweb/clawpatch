@@ -1,5 +1,6 @@
 import { FeatureRecord, TrustBoundary } from "../types.js";
 import type { NodeProjectInfo } from "./projects.js";
+import type { WorkspaceTaskGraph } from "./task-graph.js";
 
 export type SeedFileRef = {
   path: string;
@@ -18,6 +19,7 @@ export type FeatureSeed = {
   source: string;
   confidence: FeatureRecord["confidence"];
   entryPath: string;
+  identityKey?: string;
   symbol: string | null;
   route: string | null;
   command: string | null;
@@ -31,11 +33,19 @@ export type FeatureSeed = {
   skipNearbyTests?: boolean;
 };
 
+export const suppressedTestCommandTag = "validation:test-suppressed";
+
 export type FeatureMapper = {
   name: string;
+  usesNodeContext?: boolean;
   map(root: string, context: MapperContext): Promise<FeatureSeed[]>;
 };
 
+export type RootFilePolicy = "go-fallback" | "c-cpp" | "dotnet";
+export type RootFileInventory = Map<RootFilePolicy, string[]>;
+
 export type MapperContext = {
-  projects: NodeProjectInfo[];
+  nodeProjects(): Promise<NodeProjectInfo[]>;
+  nodeTaskGraph(): Promise<WorkspaceTaskGraph>;
+  rootFiles(policy: RootFilePolicy): Promise<string[]>;
 };

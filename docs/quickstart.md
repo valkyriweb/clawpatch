@@ -10,7 +10,9 @@ This guide walks through a complete review workflow from initialization to fixin
 ## Prerequisites
 
 - [Install clawpatch](install.md)
-- Install Codex CLI: `brew install codex`
+- Install Codex CLI (`brew install codex`) for the default provider, or install
+  the Grok Build CLI (`curl -fsSL https://x.ai/cli/install.sh | bash`) and pass
+  `--provider grok` when reviewing
 - Have a project with code to review
 
 ## 1. Initialize
@@ -45,12 +47,15 @@ This discovers reviewable features:
 - npm package bins and root/workspace scripts
 - Next.js routes
 - Go packages and commands
-- Java/Kotlin Gradle modules
-- Python packages, console scripts, Flask/FastAPI routes, and pytest suites
+- Java/Kotlin Gradle and Maven modules
+- Python packages, console scripts, Flask/FastAPI/Django routes, and pytest suites
+- C#/.NET projects, ASP.NET endpoints, source groups, and test projects
 - JVM semantic role groups
 - Ruby packages, Rails apps, executables, and tests
 - Rust crates and binaries
+- C/C++ standalone binaries and CMake/autotools targets
 - SwiftPM targets and tests
+- Laravel controllers, requests, jobs, commands, services, models, migrations, and tests
 - Config files
 
 Preview mapping without writing:
@@ -73,11 +78,17 @@ Review a few features in parallel:
 clawpatch review --limit 3 --jobs 3
 ```
 
+Using Grok instead of the default Codex provider:
+
+```bash
+clawpatch review --provider grok --limit 3 --jobs 3
+```
+
 This:
 
 - Selects 3 pending features
 - Reviews them in parallel with 3 workers
-- Calls the provider (Codex CLI) for each
+- Calls the selected provider (Codex or Grok CLI) for each
 - Persists findings under `.clawpatch/findings/`
 - Updates feature status
 
@@ -155,6 +166,12 @@ clawpatch review --feature <featureId>
 
 ```bash
 clawpatch review --model claude-opus-4-20250514 --limit 5
+```
+
+### Review with explicit Codex reasoning effort
+
+```bash
+clawpatch review --model gpt-5.5 --reasoning-effort xhigh --limit 5
 ```
 
 ### Filter report by category
