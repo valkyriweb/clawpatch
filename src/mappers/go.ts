@@ -1,16 +1,23 @@
-import { spawn } from "node:child_process";
+import { parseTimeoutMs } from "../timeout.js";
 import { readdir, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
+import { runCommandArgs } from "../exec.js";
 import { pathExists } from "../fs.js";
-import { packageKind, packageTrustBoundaries, normalize, shouldSkip, walk } from "./shared.js";
-import { FeatureSeed, SeedFileRef, SeedTestRef } from "./types.js";
+import { packageKind, packageTrustBoundaries, normalize, shouldSkip } from "./shared.js";
+import { FeatureSeed, MapperContext, SeedFileRef, SeedTestRef } from "./types.js";
 
-export async function goSeeds(root: string): Promise<FeatureSeed[]> {
+const defaultGoListTimeoutMs = 120_000;
+
+export function goListTimeoutMs(): number {
+  return parseTimeoutMs(process.env["CLAWPATCH_GO_LIST_TIMEOUT_MS"], defaultGoListTimeoutMs);
+}
+
+export async function goSeeds(root: string, context: MapperContext): Promise<FeatureSeed[]> {
   if (!(await pathExists(join(root, "go.mod")))) {
     return [];
   }
   const modulePath = await goModulePath(root);
-  const packages = await goPackages(root, modulePath);
+  const packages = await goPackages(root, modulePath, context);
   const packageByImport = new Map(packages.map((pkg) => [pkg.importPath, pkg]));
   const seeds: FeatureSeed[] = [];
   for (const pkg of packages) {
@@ -36,12 +43,16 @@ type GoPackageFiles = {
   generated: string[];
 };
 
-async function goPackages(root: string, modulePath: string | null): Promise<GoPackage[]> {
+async function goPackages(
+  root: string,
+  modulePath: string | null,
+  context: MapperContext,
+): Promise<GoPackage[]> {
   const listed = await goListPackages(root);
   if (listed.length > 0) {
     return listed;
   }
-  return fallbackGoPackages(root, modulePath);
+  return fallbackGoPackages(root, modulePath, context);
 }
 
 async function goListPackages(root: string): Promise<GoPackage[]> {
@@ -66,9 +77,13 @@ async function goListPackages(root: string): Promise<GoPackage[]> {
   return packages;
 }
 
-async function fallbackGoPackages(root: string, modulePath: string | null): Promise<GoPackage[]> {
+async function fallbackGoPackages(
+  root: string,
+  modulePath: string | null,
+  context: MapperContext,
+): Promise<GoPackage[]> {
   const dirs = new Set<string>();
-  for (const file of await walk(root, [""])) {
+  for (const file of await context.rootFiles("go-fallback")) {
     if (!file.endsWith(".go")) {
       continue;
     }
@@ -88,21 +103,18 @@ async function fallbackGoPackages(root: string, modulePath: string | null): Prom
   return packages;
 }
 
-async function runGoList(root: string): Promise<string> {
-  const child = spawn("go", ["list", "-e", "-f", "{{.Dir}}|{{.ImportPath}}|{{.Name}}", "./..."], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  let stdout = "";
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-  });
-  await new Promise<void>((resolve) => {
-    child.on("close", () => resolve());
-    child.on("error", () => resolve());
-  });
-  return stdout;
+export async function runGoList(root: string, timeoutMs = goListTimeoutMs()): Promise<string> {
+  const result = await runCommandArgs(
+    "go",
+    ["list", "-e", "-f", "{{.Dir}}|{{.ImportPath}}|{{.Name}}", "./..."],
+    root,
+    undefined,
+    { timeoutMs, trimOutput: false },
+  );
+  if (result.exitCode === 124) {
+    return "";
+  }
+  return result.stdout;
 }
 
 async function isSkippedGoPackageDir(root: string, dir: string): Promise<boolean> {

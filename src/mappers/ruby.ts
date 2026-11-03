@@ -2,6 +2,12 @@ import { readFile, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { pathExists } from "../fs.js";
 import {
+  fileHasRubyShebang,
+  rubyDependencyNames,
+  rubyGemspecPaths,
+  stripRubyComments,
+} from "../ruby.js";
+import {
   isSafeDirectory,
   isSafeFile,
   packageKind,
@@ -32,6 +38,14 @@ const railsBinstubs = new Set(["bundle", "rails", "rake", "setup", "spring", "ya
 const sourceGroupMaxOwnedFiles = 12;
 const sourceGroupMaxTests = 8;
 const jekyllContentMaxOwnedFiles = 24;
+const rootToolingFiles = new Set([
+  "Gemfile.lock",
+  "README.md",
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "tsconfig.json",
+]);
 
 export async function rubySeeds(root: string): Promise<FeatureSeed[]> {
   if (!(await isRubyProject(root))) {
@@ -40,7 +54,10 @@ export async function rubySeeds(root: string): Promise<FeatureSeed[]> {
   const info = await rubyProjectInfo(root);
   const projectFiles = await rubyMetadataFiles(root);
   const testFiles = await rubyTestFiles(root);
-  const testCommand = await rubyTestCommand(root, info, testFiles);
+  const runPrefix = await rubyRunPrefix(root);
+  const testCommand = rubyProjectTestCommand(runPrefix, info, testFiles);
+  const commandForTest = (path: string): string | null =>
+    rubyTestCommandForPath(path, runPrefix, info);
   const railsApp = await isRailsApp(root, info);
   const seeds: FeatureSeed[] = [];
 
@@ -64,7 +81,7 @@ export async function rubySeeds(root: string): Promise<FeatureSeed[]> {
   }
 
   for (const executable of await rubyExecutables(root, railsApp)) {
-    const tests = associatedTests([executable], testFiles, testCommand);
+    const tests = associatedTests([executable], testFiles, commandForTest);
     seeds.push({
       title: `Ruby CLI command ${basename(executable)}`,
       summary: `Ruby executable ${executable}.`,
@@ -106,7 +123,7 @@ export async function rubySeeds(root: string): Promise<FeatureSeed[]> {
   }
 
   for (const group of await rubySourceGroups(root)) {
-    const tests = associatedTests(group.files, testFiles, testCommand);
+    const tests = associatedTests(group.files, testFiles, commandForTest);
     seeds.push({
       title: `Ruby source ${group.label}`,
       summary:
@@ -131,9 +148,9 @@ export async function rubySeeds(root: string): Promise<FeatureSeed[]> {
   }
 
   seeds.push(...(await jekyllSeeds(root, info)));
-  seeds.push(...(await railsSeeds(root, info)));
+  seeds.push(...(await railsSeeds(root, info, testFiles, commandForTest, testCommand)));
 
-  for (const testSuite of standaloneTestSuites(testFiles, testCommand)) {
+  for (const testSuite of standaloneTestSuites(testFiles, commandForTest)) {
     seeds.push(testSuite);
   }
 
@@ -147,12 +164,13 @@ async function isRubyProject(root: string): Promise<boolean> {
     (await pathExists(join(root, "Rakefile"))) ||
     (await pathExists(join(root, "config.ru"))) ||
     (await rubyGemspecs(root)).length > 0 ||
+    (await rootRubySourceFiles(root)).length > 0 ||
     (await containsReviewableRubySource(root))
   );
 }
 
 async function rubyProjectInfo(root: string): Promise<RubyProjectInfo> {
-  const source = await rubyDependencySource(root);
+  const source = stripRubyComments(await rubyDependencySource(root));
   return {
     name: rubyProjectName(source),
     dependencies: rubyDependencyNames(source),
@@ -173,16 +191,12 @@ async function rubyMetadataFiles(root: string): Promise<string[]> {
 }
 
 async function rubyGemspecs(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".gemspec"))
-    .map((entry) => entry.name)
-    .toSorted();
+  return rubyGemspecPaths(root, { includeNested: true });
 }
 
 async function rubyDependencySource(root: string): Promise<string> {
   const chunks: string[] = [];
-  for (const path of [...metadataFiles, ...(await rubyGemspecs(root))]) {
+  for (const path of [...metadataFiles, ...(await rubyGemspecPaths(root))]) {
     if (await pathExists(join(root, path))) {
       chunks.push(await readFile(join(root, path), "utf8"));
     }
@@ -191,27 +205,36 @@ async function rubyDependencySource(root: string): Promise<string> {
 }
 
 function rubyProjectName(source: string): string | null {
-  return /^\s*(?:spec|s)\.name\s*=\s*["']([^"']+)["']/mu.exec(source)?.[1] ?? null;
+  const assignment = /^\s*[A-Za-z_][A-Za-z0-9_]*\.name\s*=\s*(.+)$/mu.exec(source)?.[1];
+  return assignment === undefined ? null : rubyStringLiteral(assignment);
 }
 
-function rubyDependencyNames(source: string): Set<string> {
-  const names = new Set<string>();
-  for (const line of source.split("\n")) {
-    const match =
-      /^\s*(?:gem|s\.add_dependency|s\.add_development_dependency|spec\.add_dependency|spec\.add_development_dependency)\s*\(?\s*["']([^"']+)["']/u.exec(
-        line,
-      );
-    if (match?.[1] !== undefined) {
-      names.add(match[1].toLowerCase());
-    }
+function rubyStringLiteral(source: string): string | null {
+  const trimmed = source.trimStart();
+  const quoted = /^(['"])(.*?)\1/u.exec(trimmed)?.[2];
+  if (quoted !== undefined) {
+    return quoted;
   }
-  return names;
+  const percent = /^%[qQ]([<{[(]|[^A-Za-z0-9\s])/.exec(trimmed)?.[1];
+  if (percent === undefined) {
+    return null;
+  }
+  const close =
+    new Map([
+      ["<", ">"],
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+    ]).get(percent) ?? percent;
+  const rest = trimmed.slice(3);
+  const end = rest.indexOf(close);
+  return end === -1 ? null : rest.slice(0, end);
 }
 
 function rubyTrustBoundaries(name: string, dependencies: Set<string>): TrustBoundary[] {
   const boundaries = new Set<TrustBoundary>(packageTrustBoundaries(name));
   const text = `${name} ${[...dependencies].join(" ")}`;
-  if (/\b(redis|sequel|pg|mysql|sqlite|activerecord)\b/iu.test(text)) {
+  if (/\b(redis|sequel|pg|mysql2?|sqlite3?|activerecord)\b/iu.test(text)) {
     boundaries.add("database");
     boundaries.add("network");
     boundaries.add("serialization");
@@ -321,13 +344,26 @@ async function isJekyllSite(root: string, info: RubyProjectInfo): Promise<boolea
   return (await pathExists(join(root, "_config.yml"))) && info.dependencies.has("jekyll");
 }
 
-async function railsSeeds(root: string, info: RubyProjectInfo): Promise<FeatureSeed[]> {
+type RailsRoute = {
+  method: string;
+  path: string;
+  target: string;
+};
+
+async function railsSeeds(
+  root: string,
+  info: RubyProjectInfo,
+  testFiles: string[],
+  commandForTest: (path: string) => string | null,
+  testCommand: string | null,
+): Promise<FeatureSeed[]> {
   if (!(await isRailsApp(root, info))) {
     return [];
   }
   const trustBoundaries = rubyTrustBoundaries("rails app", info.dependencies);
   const seeds: FeatureSeed[] = [];
   const configFiles = await railsConfigFiles(root);
+  const routeFile = "config/routes.rb";
   if (configFiles.length > 0) {
     seeds.push({
       title: "Rails application configuration",
@@ -347,19 +383,61 @@ async function railsSeeds(root: string, info: RubyProjectInfo): Promise<FeatureS
     });
   }
 
+  if (await isSafeFile(root, join(root, routeFile))) {
+    const source = await readFile(join(root, routeFile), "utf8");
+    for (const route of railsRouteDeclarations(source)) {
+      const handlerPath = await railsRouteHandlerPath(root, route.target);
+      const entryPath = handlerPath ?? routeFile;
+      const tests = associatedTests([entryPath], testFiles, commandForTest);
+      seeds.push({
+        title: `Rails route ${route.method} ${route.path}`,
+        summary: `Rails route ${route.method} ${route.path} maps to ${route.target}.`,
+        kind: "route",
+        source: "rails-route",
+        confidence: "high",
+        entryPath,
+        identityKey: `rails-route:${route.method}:${route.path}:${route.target}`,
+        symbol: route.target,
+        route: `${route.method} ${route.path}`,
+        command: null,
+        ownedFiles: [
+          {
+            path: entryPath,
+            reason: handlerPath === null ? "rails route declaration" : "rails route handler",
+          },
+        ],
+        contextFiles: uniqueFileRefs([
+          ...(handlerPath === null ? [] : [{ path: routeFile, reason: "route definition" }]),
+          ...tests.map((test) => ({ path: test.path, reason: "associated test" })),
+        ]),
+        tests,
+        tags: ["ruby", "rails", "route"],
+        trustBoundaries: railsRouteTrustBoundaries(route, trustBoundaries),
+        testCommand,
+        skipNearbyTests: true,
+      });
+    }
+  }
+
   const dbFiles = await railsDatabaseFiles(root);
-  if (dbFiles.length > 0) {
+  for (const group of partitionSourceFiles("db", dbFiles, sourceGroupMaxOwnedFiles)) {
     seeds.push({
-      title: "Rails database schema and migrations",
-      summary: `Rails database files with ${dbFiles.length} migration/schema file(s).`,
+      title:
+        group.label === "db"
+          ? "Rails database schema and migrations"
+          : `Rails database schema and migrations ${group.label}`,
+      summary: `Rails database group ${group.label} with ${group.files.length} migration/schema file(s).`,
       kind: "service",
       source: "rails-database",
       confidence: "high",
-      entryPath: dbFiles[0] ?? "db",
-      symbol: null,
+      entryPath: group.label,
+      symbol: group.label,
       route: null,
       command: null,
-      ownedFiles: dbFiles.map((path) => ({ path, reason: "rails database file" })),
+      ownedFiles: group.files.map((path) => ({
+        path,
+        reason: `rails database group ${group.label}`,
+      })),
       contextFiles: [],
       tags: ["ruby", "rails", "database"],
       trustBoundaries: uniqueTrustBoundaries([...trustBoundaries, "database"]),
@@ -410,6 +488,259 @@ async function railsSeeds(root: string, info: RubyProjectInfo): Promise<FeatureS
   return seeds;
 }
 
+function railsRouteDeclarations(source: string): RailsRoute[] {
+  const routes: RailsRoute[] = [];
+  const seen = new Set<string>();
+  let drawBlockDepth = 0;
+  let skippedBlockDepth = 0;
+  for (const line of stripRubyComments(source).split("\n")) {
+    const blockDelta = railsLineBlockDelta(line);
+    if (drawBlockDepth === 0) {
+      if (startsRailsRoutesDrawBlock(line) && blockDelta > 0) {
+        drawBlockDepth = blockDelta;
+      }
+      continue;
+    }
+
+    if (skippedBlockDepth > 0) {
+      skippedBlockDepth = Math.max(0, skippedBlockDepth + blockDelta);
+      drawBlockDepth = Math.max(0, drawBlockDepth + blockDelta);
+      continue;
+    }
+    const route = parseRailsRouteLine(line);
+    if (route !== null) {
+      const key = [route.method, route.path, route.target].join("\0");
+      if (!seen.has(key)) {
+        seen.add(key);
+        routes.push(route);
+      }
+    }
+    if (blockDelta === 0) {
+      continue;
+    }
+
+    if (blockDelta > 0) {
+      skippedBlockDepth = blockDelta;
+    }
+    drawBlockDepth = Math.max(0, drawBlockDepth + blockDelta);
+  }
+  return routes;
+}
+
+function startsRailsRoutesDrawBlock(line: string): boolean {
+  return /\.routes\.draw\b/u.test(line);
+}
+
+function railsLineBlockDelta(line: string): number {
+  const code = rubyLineWithoutStrings(line);
+  return rubyTokenCount(code, "do") - rubyTokenCount(code, "end") + rubyBraceDelta(code);
+}
+
+function rubyTokenCount(source: string, token: string): number {
+  const matches = source.match(new RegExp(`\\b${token}\\b`, "gu"));
+  return matches?.length ?? 0;
+}
+
+function rubyBraceDelta(source: string): number {
+  let delta = 0;
+  for (const char of source) {
+    if (char === "{") {
+      delta += 1;
+    } else if (char === "}") {
+      delta -= 1;
+    }
+  }
+  return delta;
+}
+
+function rubyLineWithoutStrings(line: string): string {
+  let code = "";
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "/" && rubyRegexLiteralStart(line, index)) {
+      const end = rubyRegexLiteralEnd(line, index);
+      code += " ".repeat(end - index + 1);
+      index = end;
+      continue;
+    }
+    if (char !== "'" && char !== '"') {
+      code += char;
+      continue;
+    }
+    code += " ";
+    const quote = char;
+    index += 1;
+    for (; index < line.length; index += 1) {
+      const next = line[index];
+      code += " ";
+      if (next === "\\") {
+        index += 1;
+        code += " ";
+      } else if (next === quote) {
+        break;
+      }
+    }
+  }
+  return code;
+}
+
+function rubyRegexLiteralStart(line: string, index: number): boolean {
+  const before = line.slice(0, index).trimEnd();
+  const previous = before.at(-1);
+  return previous === undefined || /[([{=,:!&|?>]/u.test(previous);
+}
+
+function rubyRegexLiteralEnd(line: string, start: number): number {
+  let escaped = false;
+  let inCharacterClass = false;
+  for (let index = start + 1; index < line.length; index += 1) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (char === "[") {
+      inCharacterClass = true;
+    } else if (char === "]") {
+      inCharacterClass = false;
+    } else if (char === "/" && !inCharacterClass) {
+      return index;
+    }
+  }
+  return start;
+}
+
+function parseRailsRouteLine(line: string): RailsRoute | null {
+  const rootArgs = /^\s*root\b\s*(?:\(\s*)?(.*)$/u.exec(line)?.[1];
+  if (rootArgs !== undefined) {
+    const target = railsRouteTarget(rootArgs, true);
+    return target === null ? null : { method: "GET", path: "/", target };
+  }
+
+  const route = /^\s*(get|post|put|patch|delete)\b\s*(?:\(\s*)?(.*)$/iu.exec(line);
+  if (route === null) {
+    return null;
+  }
+  const method = route[1]?.toUpperCase();
+  const args = route[2];
+  if (method === undefined || args === undefined) {
+    return null;
+  }
+  const pathLiteral = consumeRubyStringLiteral(args);
+  if (pathLiteral === null) {
+    return null;
+  }
+  const path = normalizeRailsRoutePath(pathLiteral.value);
+  const target = railsRouteTarget(pathLiteral.rest, true);
+  return path === null || target === null ? null : { method, path, target };
+}
+
+function railsRouteTarget(args: string, allowPositional: boolean): string | null {
+  const toMatch = /(?:^|[,\s])to:\s*/u.exec(args);
+  if (toMatch !== null) {
+    const literal = consumeRubyStringLiteral(args.slice(toMatch.index + toMatch[0].length));
+    return literal === null ? null : normalizeRailsRouteTarget(literal.value);
+  }
+
+  if (!allowPositional) {
+    return null;
+  }
+  const positionalArgs = args.trimStart().replace(/^,\s*/u, "");
+  const literal = consumeRubyStringLiteral(positionalArgs);
+  return literal === null ? null : normalizeRailsRouteTarget(literal.value);
+}
+
+function consumeRubyStringLiteral(source: string): { value: string; rest: string } | null {
+  const leadingWhitespace = /^\s*/u.exec(source)?.[0].length ?? 0;
+  const trimmed = source.slice(leadingWhitespace);
+  const quote = trimmed[0];
+  if (quote === "'" || quote === '"') {
+    let escaped = false;
+    for (let index = 1; index < trimmed.length; index += 1) {
+      const char = trimmed[index];
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        return {
+          value: trimmed.slice(1, index),
+          rest: trimmed.slice(index + 1),
+        };
+      }
+    }
+    return null;
+  }
+
+  const percent = /^%[qQ]([<{[(]|[^A-Za-z0-9\s])/u.exec(trimmed)?.[1];
+  if (percent === undefined) {
+    return null;
+  }
+  const close =
+    new Map([
+      ["<", ">"],
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+    ]).get(percent) ?? percent;
+  const rest = trimmed.slice(3);
+  const end = rest.indexOf(close);
+  return end === -1
+    ? null
+    : {
+        value: rest.slice(0, end),
+        rest: rest.slice(end + 1),
+      };
+}
+
+function normalizeRailsRoutePath(path: string): string | null {
+  const trimmed = path.trim();
+  if (trimmed.length === 0 || trimmed.includes("#{") || trimmed.includes("*")) {
+    return null;
+  }
+  const normalized = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return normalized.length > 1 ? normalized.replace(/\/+$/u, "") : normalized;
+}
+
+function normalizeRailsRouteTarget(target: string): string | null {
+  const trimmed = target.trim();
+  return /^[A-Za-z0-9_/]+#[A-Za-z_][A-Za-z0-9_!?]*$/u.test(trimmed) ? trimmed : null;
+}
+
+async function railsRouteHandlerPath(root: string, target: string): Promise<string | null> {
+  const controller = target.split("#")[0];
+  if (controller === undefined) {
+    return null;
+  }
+  const path = `app/controllers/${controller}_controller.rb`;
+  return (await isSafeFile(root, join(root, path))) ? path : null;
+}
+
+function railsRouteTrustBoundaries(
+  route: RailsRoute,
+  appTrustBoundaries: TrustBoundary[],
+): TrustBoundary[] {
+  const boundaries = new Set<TrustBoundary>([
+    ...appTrustBoundaries,
+    "user-input",
+    "network",
+    "serialization",
+  ]);
+  if (
+    route.method !== "GET" ||
+    /(^|\/)(account|admin|auth|login|logout|oauth|password|session|token)(\/|$)/iu.test(
+      route.path,
+    ) ||
+    /(^|\/)(admin|auth|oauth|sessions?)(\/|#|$)/iu.test(route.target)
+  ) {
+    boundaries.add("auth");
+  }
+  if (/(^|\/)(callback|integration|webhook)(\/|$)/iu.test(route.path)) {
+    boundaries.add("external-api");
+  }
+  return [...boundaries];
+}
+
 async function isRailsApp(root: string, info: RubyProjectInfo): Promise<boolean> {
   return info.dependencies.has("rails") && (await pathExists(join(root, "config/application.rb")));
 }
@@ -419,7 +750,6 @@ async function railsConfigFiles(root: string): Promise<string[]> {
     "config/application.rb",
     "config/routes.rb",
     "config/environment.rb",
-    "config/database.yml",
     "config/boot.rb",
   ]);
   for (const prefix of ["config/environments", "config/initializers", "config/locales"]) {
@@ -428,11 +758,16 @@ async function railsConfigFiles(root: string): Promise<string[]> {
     }
     files.push(
       ...(await walk(root, [prefix])).filter(
-        (path) => /\.(rb|ya?ml)$/u.test(path) && !rubyShouldSkip(path),
+        (path) =>
+          /\.(rb|ya?ml)$/u.test(path) && !rubyShouldSkip(path) && !isSensitiveRailsConfig(path),
       ),
     );
   }
-  return uniquePaths(files);
+  return uniquePathsInOrder(files);
+}
+
+function isSensitiveRailsConfig(path: string): boolean {
+  return /^config\/initializers\/(?:secret_token|secret_key_base)\.rb$/u.test(path);
 }
 
 async function railsDatabaseFiles(root: string): Promise<string[]> {
@@ -440,7 +775,7 @@ async function railsDatabaseFiles(root: string): Promise<string[]> {
     return [];
   }
   return (await walk(root, ["db"]))
-    .filter((path) => /\.(rb|ya?ml)$/u.test(path) && !rubyShouldSkip(path))
+    .filter((path) => /\.(rb|ya?ml|sql)$/u.test(path) && !rubyShouldSkip(path))
     .toSorted();
 }
 
@@ -455,16 +790,30 @@ async function railsViewGroups(root: string): Promise<SourceGroup[]> {
 }
 
 async function railsAssetGroups(root: string): Promise<SourceGroup[]> {
-  if (!(await isSafeDirectory(root, join(root, "app/assets")))) {
-    return [];
+  const hasNodePackage = await pathExists(join(root, "package.json"));
+  const roots = ["app/assets", "app/javascript", "app/packs", "app/frontend"];
+  const groups: SourceGroup[] = [];
+  for (const prefix of roots) {
+    if (!(await isSafeDirectory(root, join(root, prefix)))) {
+      continue;
+    }
+    const files = (await walk(root, [prefix])).filter(
+      (path) =>
+        isRailsAssetFile(path, hasNodePackage) &&
+        !rubyShouldSkip(path) &&
+        !pathMatchesPrefix(path, "app/assets/builds") &&
+        !path.includes("/images/"),
+    );
+    groups.push(...partitionSourceFiles(prefix, files, jekyllContentMaxOwnedFiles));
   }
-  const files = (await walk(root, ["app/assets"])).filter(
-    (path) =>
-      /\.(js|coffee|css|scss|sass)$/u.test(path) &&
-      !rubyShouldSkip(path) &&
-      !path.includes("/images/"),
-  );
-  return partitionSourceFiles("app/assets", files, jekyllContentMaxOwnedFiles);
+  return groups;
+}
+
+function isRailsAssetFile(path: string, hasNodePackage: boolean): boolean {
+  if (hasNodePackage && !pathMatchesPrefix(path, "app/assets")) {
+    return /\.(coffee|css|scss|sass)$/u.test(path);
+  }
+  return /\.(ts|tsx|js|jsx|mts|cts|mjs|cjs|coffee|css|scss|sass)$/u.test(path);
 }
 
 async function existingFiles(root: string, candidates: string[]): Promise<string[]> {
@@ -483,7 +832,7 @@ async function jekyllRootPages(root: string): Promise<string[]> {
     .filter((entry) => entry.isFile())
     .map((entry) => entry.name)
     .filter((path) => /\.(md|html|json)$/u.test(path))
-    .filter((path) => !["README.md", "Gemfile.lock"].includes(path))
+    .filter((path) => !rootToolingFiles.has(path))
     .toSorted();
 }
 
@@ -556,15 +905,23 @@ function groupByPostYear(posts: string[]): Map<string, string[]> {
 
 async function rubyExecutables(root: string, skipRailsBinstubs: boolean): Promise<string[]> {
   const executables: string[] = [];
-  for (const executableRoot of executableRoots) {
+  for (const executableRoot of await rubyExecutableRoots(root)) {
     if (!(await isSafeDirectory(root, join(root, executableRoot)))) {
       continue;
     }
     for (const path of await walk(root, [executableRoot])) {
-      if (skipRailsBinstubs && executableRoot === "bin" && railsBinstubs.has(basename(path))) {
+      if (
+        skipRailsBinstubs &&
+        executableRoot.endsWith("bin") &&
+        railsBinstubs.has(basename(path))
+      ) {
         continue;
       }
-      if (!rubyShouldSkip(path) && (path.endsWith(".rb") || (await hasRubyShebang(root, path)))) {
+      if (
+        !rubyShouldSkip(path) &&
+        (path.endsWith(".rb") ||
+          (isRubyShebangCandidate(path) && (await hasRubyShebang(root, path))))
+      ) {
         executables.push(path);
       }
     }
@@ -576,13 +933,13 @@ async function hasRubyShebang(root: string, path: string): Promise<boolean> {
   if (!(await isSafeFile(root, join(root, path)))) {
     return false;
   }
-  const head = (await readFile(join(root, path), "utf8").catch(() => "")).slice(0, 160);
-  return /^#!.*\bruby\b/u.test(head);
+  return fileHasRubyShebang(join(root, path));
 }
 
 async function rubySourceGroups(root: string): Promise<SourceGroup[]> {
   const groups: SourceGroup[] = [];
-  for (const sourceRoot of sourceRoots) {
+  groups.push(...(await rootRubySourceGroups(root)));
+  for (const sourceRoot of await rubySourceRoots(root)) {
     if (!(await isSafeDirectory(root, join(root, sourceRoot)))) {
       continue;
     }
@@ -592,56 +949,143 @@ async function rubySourceGroups(root: string): Promise<SourceGroup[]> {
   return groups;
 }
 
-async function rubyTestFiles(root: string): Promise<string[]> {
-  const files = (await walk(root, ["spec", "test", ...sourceRoots]))
-    .filter(isRubyTestPath)
-    .filter((path) => !rubyShouldSkip(path) && !isRubyFixturePath(path));
-  return uniquePaths(files).slice(0, 200);
+async function rootRubySourceGroups(root: string): Promise<SourceGroup[]> {
+  return chunkFiles("root", await rootRubySourceFiles(root), sourceGroupMaxOwnedFiles);
 }
 
-async function rubyTestCommand(
-  root: string,
+async function rootRubySourceFiles(root: string): Promise<string[]> {
+  return (await readdir(root, { withFileTypes: true }).catch(() => []))
+    .filter((entry) => entry.isFile() && isReviewableRubySourceFile(entry.name))
+    .map((entry) => entry.name)
+    .toSorted();
+}
+
+async function rubyTestFiles(root: string): Promise<string[]> {
+  const rootTests = await rootRubyTestFiles(root);
+  const files = (await walk(root, await rubyTestRoots(root)))
+    .filter(isRubyTestPath)
+    .filter((path) => !rubyShouldSkip(path) && !isRubyFixturePath(path));
+  return uniquePaths([...rootTests, ...files]).slice(0, 200);
+}
+
+async function rubySourceRoots(root: string): Promise<string[]> {
+  const roots: string[] = [...sourceRoots];
+  for (const packageRoot of await nestedRubyPackageRoots(root)) {
+    roots.push(...sourceRoots.map((sourceRoot) => `${packageRoot}/${sourceRoot}`));
+  }
+  return uniquePaths(roots);
+}
+
+async function rubyExecutableRoots(root: string): Promise<string[]> {
+  const roots: string[] = [...executableRoots];
+  for (const packageRoot of await nestedRubyPackageRoots(root)) {
+    roots.push(...executableRoots.map((executableRoot) => `${packageRoot}/${executableRoot}`));
+  }
+  return uniquePaths(roots);
+}
+
+async function rubyTestRoots(root: string): Promise<string[]> {
+  const roots = ["spec", "test", ...(await rubySourceRoots(root))];
+  for (const packageRoot of await nestedRubyPackageRoots(root)) {
+    roots.push(`${packageRoot}/spec`, `${packageRoot}/test`);
+  }
+  return uniquePaths(roots);
+}
+
+async function nestedRubyPackageRoots(root: string): Promise<string[]> {
+  const packageRoots = new Set<string>();
+  for (const gemspec of await rubyGemspecs(root)) {
+    const packageRoot = dirname(gemspec);
+    if (
+      packageRoot !== "." &&
+      !rubyShouldSkip(packageRoot) &&
+      (await isSafeDirectory(root, join(root, packageRoot)))
+    ) {
+      packageRoots.add(packageRoot);
+    }
+  }
+  return [...packageRoots].toSorted();
+}
+
+async function rootRubyTestFiles(root: string): Promise<string[]> {
+  return (await readdir(root, { withFileTypes: true }).catch(() => []))
+    .filter((entry) => entry.isFile() && isRubyTestPath(entry.name))
+    .map((entry) => entry.name)
+    .toSorted();
+}
+
+async function rubyRunPrefix(root: string): Promise<string> {
+  return (await pathExists(join(root, "Gemfile"))) || (await pathExists(join(root, "gems.rb")))
+    ? "bundle exec "
+    : "";
+}
+
+function rubyProjectTestCommand(
+  runPrefix: string,
   info: RubyProjectInfo,
   testFiles: string[],
-): Promise<string | null> {
-  const run = (await pathExists(join(root, "Gemfile"))) ? "bundle exec " : "";
+): string | null {
   if (info.hasRspec || testFiles.some((path) => path.endsWith("_spec.rb"))) {
-    return `${run}rspec`;
+    return `${runPrefix}rspec`;
   }
   if (info.hasMinitest || testFiles.some((path) => path.endsWith("_test.rb"))) {
-    return `${run}rake test`;
+    return `${runPrefix}rake test`;
   }
   return null;
 }
 
-function standaloneTestSuites(testFiles: string[], command: string | null): FeatureSeed[] {
+function rubyTestCommandForPath(
+  path: string,
+  runPrefix: string,
+  info: RubyProjectInfo,
+): string | null {
+  if (path.endsWith("_spec.rb") || (path.startsWith("spec/") && info.hasRspec)) {
+    return `${runPrefix}rspec`;
+  }
+  if (isRubyMinitestPath(path) || (path.startsWith("test/") && info.hasMinitest)) {
+    return `${runPrefix}rake test`;
+  }
+  return rubyProjectTestCommand(runPrefix, info, [path]);
+}
+
+function standaloneTestSuites(
+  testFiles: string[],
+  commandForTest: (path: string) => string | null,
+): FeatureSeed[] {
   const groups = new Map<string, string[]>();
   for (const path of testFiles) {
     const root = path.startsWith("spec/")
       ? "spec"
       : path.startsWith("test/")
         ? "test"
-        : dirname(path);
+        : path.includes("/")
+          ? dirname(path)
+          : "root";
     groups.set(root, [...(groups.get(root) ?? []), path]);
   }
   return [...groups.entries()]
     .toSorted(([left], [right]) => left.localeCompare(right))
-    .map(([label, files]) => ({
-      title: `Ruby test suite ${label}`,
-      summary: `Ruby test files in ${label}.`,
+    .flatMap(([label, files]) =>
+      label === "root"
+        ? chunkFiles(label, files.toSorted(), sourceGroupMaxOwnedFiles)
+        : partitionSourceFiles(label, files, sourceGroupMaxOwnedFiles),
+    )
+    .map((group) => ({
+      title: `Ruby test suite ${group.label}`,
+      summary: `Ruby test files in ${group.label}.`,
       kind: "test-suite",
       source: "ruby-test-suite",
       confidence: "medium",
-      entryPath: label,
-      symbol: label,
+      entryPath: group.label,
+      symbol: group.label,
       route: null,
       command: null,
-      ownedFiles: files.map((path) => ({ path, reason: "ruby test file" })),
+      ownedFiles: group.files.map((path) => ({ path, reason: "ruby test file" })),
       contextFiles: [],
-      tests: files.map((path) => ({ path, command })),
+      tests: group.files.map((path) => ({ path, command: commandForTest(path) })),
       tags: ["ruby", "test"],
       trustBoundaries: [],
-      testCommand: command,
+      testCommand: group.files.length > 0 ? commandForTest(group.files[0] ?? "") : null,
       skipNearbyTests: true,
     }));
 }
@@ -750,19 +1194,34 @@ function bucketPrefix(files: string[], sourceRoot: string, depth: number, segmen
   return [...parts, segment].join("/");
 }
 
-function associatedTests(files: string[], tests: string[], command: string | null): SeedTestRef[] {
+function associatedTests(
+  files: string[],
+  tests: string[],
+  commandForTest: (path: string) => string | null,
+): SeedTestRef[] {
   const fileStems = new Set(files.map((file) => basename(file).replace(/\.rb$/u, "")));
   const dirs = new Set(files.map((file) => dirname(file)));
   return tests
     .filter((test) => {
-      const testStem = basename(test)
-        .replace(/_spec\.rb$/u, "")
-        .replace(/_test\.rb$/u, "")
-        .replace(/\.rb$/u, "");
+      const testStem = rubyTestStem(test);
       return [...dirs].some((dir) => pathMatchesPrefix(test, dir)) || fileStems.has(testStem);
     })
     .slice(0, sourceGroupMaxTests)
-    .map((path) => ({ path, command }));
+    .map((path) => ({ path, command: commandForTest(path) }));
+}
+
+function rubyTestStem(path: string): string {
+  const name = basename(path);
+  if (name.endsWith("_spec.rb")) {
+    return name.replace(/_spec\.rb$/u, "");
+  }
+  if (name.endsWith("_test.rb")) {
+    return name.replace(/_test\.rb$/u, "");
+  }
+  if (/^test_.+\.rb$/u.test(name)) {
+    return name.replace(/^test_/u, "").replace(/\.rb$/u, "");
+  }
+  return name.replace(/\.rb$/u, "");
 }
 
 function isReviewableRubySourceFile(path: string): boolean {
@@ -776,8 +1235,21 @@ function isReviewableRubySourceFile(path: string): boolean {
 }
 
 function isRubyTestPath(path: string): boolean {
+  return path.endsWith(".rb") && (basename(path).endsWith("_spec.rb") || isRubyMinitestPath(path));
+}
+
+function isRubyMinitestPath(path: string): boolean {
   const name = basename(path);
-  return path.endsWith(".rb") && (name.endsWith("_spec.rb") || name.endsWith("_test.rb"));
+  return (
+    name.endsWith("_test.rb") ||
+    (/^test_.+\.rb$/u.test(name) &&
+      !isRubyTestHelper(name) &&
+      (path === name || /(^|\/)test\//u.test(path)))
+  );
+}
+
+function isRubyTestHelper(name: string): boolean {
+  return /^test_helpers?\.rb$/u.test(name);
 }
 
 function isRubyFixturePath(path: string): boolean {
@@ -785,11 +1257,15 @@ function isRubyFixturePath(path: string): boolean {
 }
 
 function rubyShouldSkip(path: string): boolean {
-  return shouldSkip(path) || /(^|\/)(\.bundle|vendor\/bundle|tmp|log)(\/|$)/u.test(path);
+  return (
+    shouldSkip(path) ||
+    /(^|\/)(\.bundle|vendor\/bundle)(\/|$)/u.test(path) ||
+    /^(?:tmp|log)(?:\/|$)/u.test(path)
+  );
 }
 
 async function containsReviewableRubySource(root: string): Promise<boolean> {
-  for (const sourceRoot of [...sourceRoots, ...executableRoots]) {
+  for (const sourceRoot of await rubySourceRoots(root)) {
     if (!(await isSafeDirectory(root, join(root, sourceRoot)))) {
       continue;
     }
@@ -797,9 +1273,43 @@ async function containsReviewableRubySource(root: string): Promise<boolean> {
       return true;
     }
   }
+  for (const sourceRoot of await rubyExecutableRoots(root)) {
+    if (!(await isSafeDirectory(root, join(root, sourceRoot)))) {
+      continue;
+    }
+    for (const path of await walk(root, [sourceRoot])) {
+      if (
+        isReviewableRubySourceFile(path) ||
+        (isRubyShebangCandidate(path) && (await hasRubyShebang(root, path)))
+      ) {
+        return true;
+      }
+    }
+  }
   return false;
+}
+
+function isRubyShebangCandidate(path: string): boolean {
+  return !basename(path).includes(".");
 }
 
 function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)].toSorted();
+}
+
+function uniquePathsInOrder(paths: string[]): string[] {
+  return [...new Set(paths)];
+}
+
+function uniqueFileRefs(refs: SeedFileRef[]): SeedFileRef[] {
+  const seen = new Set<string>();
+  const uniqueRefs: SeedFileRef[] = [];
+  for (const ref of refs) {
+    const key = `${ref.path}\0${ref.reason}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniqueRefs.push(ref);
+    }
+  }
+  return uniqueRefs;
 }

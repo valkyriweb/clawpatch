@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
   cleanLocksCommand,
+  ciCommand,
   doctorCommand,
   fixCommand,
   initCommand,
@@ -13,12 +14,14 @@ import {
   revalidateCommand,
   reviewCommand,
   nextCommand,
+  openPrCommand,
   showCommand,
   statusCommand,
   triageCommand,
 } from "./app.js";
 import { ClawpatchError } from "./errors.js";
 import { GlobalOptions } from "./config.js";
+import { httpRoots } from "./http-relations.js";
 
 const moduleRequire = createRequire(import.meta.url);
 
@@ -42,34 +45,10 @@ async function dispatch(
   command: string,
   flags: Record<string, string | boolean>,
 ): Promise<unknown> {
-  switch (command) {
-    case "init":
-      return initCommand(context, flags);
-    case "map":
-      return mapCommand(context, flags);
-    case "status":
-      return statusCommand(context);
-    case "review":
-      return reviewCommand(context, flags);
-    case "report":
-      return reportCommand(context, flags);
-    case "show":
-      return showCommand(context, flags);
-    case "next":
-      return nextCommand(context, flags);
-    case "triage":
-      return triageCommand(context, flags);
-    case "fix":
-      return fixCommand(context, flags);
-    case "revalidate":
-      return revalidateCommand(context, flags);
-    case "doctor":
-      return doctorCommand(context);
-    case "clean-locks":
-      return cleanLocksCommand(context);
-    default:
-      throw new ClawpatchError(`unknown command: ${command}`, 2, "invalid-usage");
+  if (!isKnownCommand(command)) {
+    throw new ClawpatchError(`unknown command: ${command}`, 2, "invalid-usage");
   }
+  return commandSpecs[command].run(context, flags);
 }
 
 type ParsedArgs = {
@@ -101,37 +80,31 @@ export function parseArgs(argv: string[]): ParsedArgs {
       command = arg;
       continue;
     }
-    const globalValueName = arg.startsWith("--") ? camel(arg.replace(/^--/u, "")) : "";
-    const target = isGlobalFlag(globalValueName) ? global : flags;
     if (arg === "-h" || arg === "--help") {
       return { command, flags, global, help: true, version: false };
     }
     if (arg === "--version") {
       return { command, flags, global, help: false, version: true };
     }
-    const valueName = arg.replace(/^--/u, "");
-    if (valueFlagNames.has(valueName)) {
+    const longName = arg.startsWith("--") ? arg.slice(2) : "";
+    const longOption = optionSpecs[longName];
+    if (longOption?.kind === "value") {
       const next = readFlagValue(argv, index, arg);
       index += 1;
-      setFlag(target, camel(valueName), next);
+      setOption(global, flags, longOption, next);
       continue;
     }
-    if (arg.startsWith("--") && isBooleanFlag(valueName)) {
-      setFlag(target, camel(valueName), true);
+    if (longOption?.kind === "boolean") {
+      setOption(global, flags, longOption, true);
       continue;
     }
-    if (arg === "-q") {
-      global.quiet = true;
-      continue;
-    }
-    if (arg === "-v") {
-      global.verbose = true;
-      continue;
-    }
-    if (arg === "-o") {
-      const next = readFlagValue(argv, index, "-o");
-      index += 1;
-      flags["output"] = next;
+    const shortOption = shortOptionSpecs[arg];
+    if (shortOption !== undefined) {
+      const value = shortOption.kind === "value" ? readFlagValue(argv, index, arg) : true;
+      if (shortOption.kind === "value") {
+        index += 1;
+      }
+      setOption(global, flags, shortOption, value);
       continue;
     }
     throw new ClawpatchError(`unknown arg: ${arg}`, 2, "invalid-usage");
@@ -140,77 +113,324 @@ export function parseArgs(argv: string[]): ParsedArgs {
     command = "status";
   }
   validateCommandFlags(command, flags);
+  if (typeof flags["linkHttp"] === "string") httpRoots(flags["linkHttp"]);
   validateCommandRequirements(command, flags);
   return { command, flags, global, help: false, version: false };
 }
 
-const commandFlags = {
-  init: new Set(["force"]),
-  map: new Set(["dryRun"]),
-  status: new Set<string>(),
-  review: new Set(["feature", "project", "limit", "since", "jobs", "provider", "model", "dryRun"]),
-  report: new Set(["status", "severity", "feature", "project", "category", "triage", "output"]),
-  show: new Set(["finding"]),
-  next: new Set(["status", "project"]),
-  triage: new Set(["finding", "status", "note"]),
-  fix: new Set(["finding", "provider", "model", "dryRun"]),
-  revalidate: new Set([
-    "finding",
-    "all",
-    "status",
-    "severity",
-    "feature",
-    "category",
-    "triage",
-    "limit",
-    "since",
-    "provider",
-    "model",
-  ]),
-  doctor: new Set<string>(),
-  "clean-locks": new Set<string>(),
-} satisfies Record<string, Set<string>>;
-
-const requiredCommandFlags: Partial<Record<keyof typeof commandFlags, string[]>> = {
-  show: ["finding"],
-  triage: ["finding", "status"],
-  fix: ["finding"],
+type Flags = Record<string, string | boolean>;
+type CommandContext = Awaited<ReturnType<typeof makeContext>>;
+type CommandSpec = {
+  flags: readonly string[];
+  usage: readonly string[];
+  required?: readonly string[];
+  helpOverrides?: Readonly<Record<string, string>>;
+  globalHelp?: readonly string[];
+  validate?: (flags: Flags) => void;
+  run: (context: CommandContext, flags: Flags) => Promise<unknown>;
 };
 
-const valueFlagNames = new Set([
-  "root",
-  "state-dir",
-  "config",
-  "feature",
-  "finding",
-  "limit",
-  "since",
-  "jobs",
-  "provider",
-  "model",
-  "output",
-  "status",
-  "severity",
-  "category",
-  "triage",
-  "project",
-  "note",
-]);
+const commandSpecs = {
+  init: { flags: ["force"], usage: ["clawpatch init [flags]"], run: initCommand },
+  map: {
+    flags: [
+      "dryRun",
+      "source",
+      "provider",
+      "model",
+      "reasoningEffort",
+      "skipGitRepoCheck",
+      "linkHttp",
+    ],
+    usage: ["clawpatch map [flags]"],
+    run: mapCommand,
+  },
+  status: { flags: [], usage: ["clawpatch status [flags]"], run: statusCommand },
+  review: {
+    flags: [
+      "feature",
+      "featureList",
+      "linkHttp",
+      "project",
+      "limit",
+      "since",
+      "jobs",
+      "mode",
+      "rateLimitPerMinute",
+      "provider",
+      "model",
+      "reasoningEffort",
+      "skipGitRepoCheck",
+      "dryRun",
+      "promptFile",
+      "exportTribunalLedger",
+      "includeDirty",
+      "noRegistryVerify",
+    ],
+    usage: ["clawpatch review [flags]"],
+    globalHelp: ["json", "quiet"],
+    validate: validateReviewFlags,
+    run: reviewCommand,
+  },
+  ci: {
+    flags: [
+      "limit",
+      "since",
+      "jobs",
+      "rateLimitPerMinute",
+      "provider",
+      "model",
+      "reasoningEffort",
+      "skipGitRepoCheck",
+      "output",
+      "includeDirty",
+      "noRegistryVerify",
+    ],
+    usage: ["clawpatch ci [flags]"],
+    helpOverrides: {
+      noRegistryVerify: "  --no-registry-verify    see clawpatch review --help for details",
+    },
+    run: ciCommand,
+  },
+  report: {
+    flags: ["status", "severity", "feature", "project", "category", "triage", "output"],
+    usage: ["clawpatch report [flags]"],
+    run: reportCommand,
+  },
+  show: {
+    flags: ["finding"],
+    usage: ["clawpatch show --finding <id> [flags]"],
+    required: ["finding"],
+    run: showCommand,
+  },
+  next: {
+    flags: ["status", "project"],
+    usage: ["clawpatch next [flags]"],
+    helpOverrides: { status: "  --status <status>  default: open" },
+    run: nextCommand,
+  },
+  triage: {
+    flags: ["finding", "status", "note"],
+    usage: ["clawpatch triage --finding <id> --status <status> [flags]"],
+    required: ["finding", "status"],
+    helpOverrides: {
+      status: "  --status <open|false-positive|fixed|wont-fix|uncertain>",
+    },
+    run: triageCommand,
+  },
+  fix: {
+    flags: ["finding", "provider", "model", "reasoningEffort", "skipGitRepoCheck", "dryRun"],
+    usage: ["clawpatch fix --finding <id> [flags]"],
+    required: ["finding"],
+    run: fixCommand,
+  },
+  "open-pr": {
+    flags: ["patch", "base", "branch", "title", "draft", "dryRun", "force"],
+    usage: ["clawpatch open-pr --patch <id> [flags]"],
+    required: ["patch"],
+    run: openPrCommand,
+  },
+  revalidate: {
+    flags: [
+      "finding",
+      "all",
+      "status",
+      "severity",
+      "feature",
+      "category",
+      "triage",
+      "limit",
+      "since",
+      "provider",
+      "model",
+      "reasoningEffort",
+      "skipGitRepoCheck",
+      "includeDirty",
+    ],
+    usage: [
+      "clawpatch revalidate --finding <id> [flags]",
+      "clawpatch revalidate --since <ref> [flags]",
+    ],
+    validate: validateRevalidateFlags,
+    run: revalidateCommand,
+  },
+  doctor: {
+    flags: ["provider", "model", "reasoningEffort"],
+    usage: ["clawpatch doctor [flags]"],
+    run: doctorCommand,
+  },
+  "clean-locks": {
+    flags: ["staleOnly"],
+    usage: ["clawpatch clean-locks [flags]"],
+    run: cleanLocksCommand,
+  },
+} satisfies Record<string, CommandSpec>;
 
-const booleanFlagNames = new Set([
-  "json",
-  "plain",
-  "quiet",
-  "verbose",
-  "debug",
-  "no-color",
-  "no-input",
-  "dry-run",
-  "force",
-  "all",
-]);
+type OptionSpec = {
+  name: string;
+  kind: "value" | "boolean";
+  target: "global" | "command";
+  help: string;
+};
 
-const shortFlagNames = new Set(["-h", "-q", "-v", "-o"]);
+const optionSpecs: Record<string, OptionSpec> = {
+  root: { name: "root", kind: "value", target: "global", help: "  --root <path>" },
+  "state-dir": {
+    name: "stateDir",
+    kind: "value",
+    target: "global",
+    help: "  --state-dir <path>",
+  },
+  config: { name: "config", kind: "value", target: "global", help: "  --config <path>" },
+  json: { name: "json", kind: "boolean", target: "global", help: "  --json" },
+  plain: { name: "plain", kind: "boolean", target: "global", help: "  --plain" },
+  quiet: { name: "quiet", kind: "boolean", target: "global", help: "  -q, --quiet" },
+  verbose: { name: "verbose", kind: "boolean", target: "global", help: "  -v, --verbose" },
+  debug: { name: "debug", kind: "boolean", target: "global", help: "  --debug" },
+  "no-color": {
+    name: "noColor",
+    kind: "boolean",
+    target: "global",
+    help: "  --no-color",
+  },
+  "no-input": {
+    name: "noInput",
+    kind: "boolean",
+    target: "global",
+    help: "  --no-input",
+  },
+  feature: { name: "feature", kind: "value", target: "command", help: "  --feature <id>" },
+  "feature-list": {
+    name: "featureList",
+    kind: "value",
+    target: "command",
+    help: "  --feature-list <path>",
+  },
+  finding: { name: "finding", kind: "value", target: "command", help: "  --finding <id>" },
+  limit: { name: "limit", kind: "value", target: "command", help: "  --limit <n>" },
+  since: { name: "since", kind: "value", target: "command", help: "  --since <ref>" },
+  jobs: {
+    name: "jobs",
+    kind: "value",
+    target: "command",
+    help: "  --jobs <n>        default: ~half of CPU cores, max 10",
+  },
+  mode: {
+    name: "mode",
+    kind: "value",
+    target: "command",
+    help: "  --mode <default|deslopify>",
+  },
+  "rate-limit-per-minute": {
+    name: "rateLimitPerMinute",
+    kind: "value",
+    target: "command",
+    help: "  --rate-limit-per-minute <n>   cap provider calls per 60s window (env: CLAWPATCH_RPM)",
+  },
+  "link-http": {
+    name: "linkHttp",
+    kind: "value",
+    target: "command",
+    help: "  --link-http <caller:backend>  opt-in HTTP candidate context between directory roots",
+  },
+  source: {
+    name: "source",
+    kind: "value",
+    target: "command",
+    help: "  --source <heuristic|auto|agent>",
+  },
+  provider: {
+    name: "provider",
+    kind: "value",
+    target: "command",
+    help: "  --provider <name>",
+  },
+  model: { name: "model", kind: "value", target: "command", help: "  --model <name>" },
+  "reasoning-effort": {
+    name: "reasoningEffort",
+    kind: "value",
+    target: "command",
+    help: "  --reasoning-effort <none|minimal|low|medium|high|xhigh>",
+  },
+  "prompt-file": {
+    name: "promptFile",
+    kind: "value",
+    target: "command",
+    help: '  --prompt-file <path>    appends extra reviewer guidance to the prompt;\n                          use "-" to read from stdin',
+  },
+  "export-tribunal-ledger": {
+    name: "exportTribunalLedger",
+    kind: "value",
+    target: "command",
+    help: "  --export-tribunal-ledger <path>\n                          after the review completes, emit a single\n                          JSONL file with one line per finding shaped\n                          for downstream Tribunal-style signed-ledger\n                          ingest. Opt-in; no effect when omitted.",
+  },
+  output: { name: "output", kind: "value", target: "command", help: "  --output <path>" },
+  status: { name: "status", kind: "value", target: "command", help: "  --status <status>" },
+  severity: {
+    name: "severity",
+    kind: "value",
+    target: "command",
+    help: "  --severity <severity>",
+  },
+  category: {
+    name: "category",
+    kind: "value",
+    target: "command",
+    help: "  --category <category>",
+  },
+  triage: { name: "triage", kind: "value", target: "command", help: "  --triage <triage>" },
+  project: {
+    name: "project",
+    kind: "value",
+    target: "command",
+    help: "  --project <name-or-root>",
+  },
+  note: { name: "note", kind: "value", target: "command", help: "  --note <text>" },
+  patch: { name: "patch", kind: "value", target: "command", help: "  --patch <id>" },
+  base: { name: "base", kind: "value", target: "command", help: "  --base <branch>" },
+  branch: { name: "branch", kind: "value", target: "command", help: "  --branch <branch>" },
+  title: { name: "title", kind: "value", target: "command", help: "  --title <title>" },
+  "dry-run": { name: "dryRun", kind: "boolean", target: "command", help: "  --dry-run" },
+  "skip-git-repo-check": {
+    name: "skipGitRepoCheck",
+    kind: "boolean",
+    target: "command",
+    help: "  --skip-git-repo-check",
+  },
+  force: { name: "force", kind: "boolean", target: "command", help: "  --force" },
+  all: { name: "all", kind: "boolean", target: "command", help: "  --all" },
+  draft: { name: "draft", kind: "boolean", target: "command", help: "  --draft" },
+  "stale-only": {
+    name: "staleOnly",
+    kind: "boolean",
+    target: "command",
+    help: "  --stale-only",
+  },
+  "include-dirty": {
+    name: "includeDirty",
+    kind: "boolean",
+    target: "command",
+    help: "  --include-dirty",
+  },
+  "no-registry-verify": {
+    name: "noRegistryVerify",
+    kind: "boolean",
+    target: "command",
+    help: '  --no-registry-verify    disable a configured npm-registry post-validator that\n                          drops findings whose "package X@Y is\n                          unpublished" claim is refuted by the registry.\n                          Set registryVerifier.enabled=true in config.json\n                          to opt in; this flag disables it for one run.',
+  },
+};
+
+const optionSpecsByName = new Map(
+  Object.values(optionSpecs).map((option) => [option.name, option] as const),
+);
+
+const shortOptionSpecs: Record<string, OptionSpec> = {
+  "-q": optionSpecs["quiet"]!,
+  "-v": optionSpecs["verbose"]!,
+  "-o": optionSpecs["output"]!,
+};
+
+const shortFlagNames = new Set(["-h", ...Object.keys(shortOptionSpecs)]);
 
 export function packageVersion(): string {
   const pkg = moduleRequire("../package.json") as { version?: unknown };
@@ -221,7 +441,7 @@ function validateCommandFlags(command: string, flags: Record<string, string | bo
   if (!isKnownCommand(command)) {
     throw new ClawpatchError(`unknown command: ${command}`, 2, "invalid-usage");
   }
-  const allowed = commandFlags[command];
+  const allowed = new Set(commandSpecs[command].flags);
   for (const flag of Object.keys(flags)) {
     if (!allowed.has(flag)) {
       throw new ClawpatchError(
@@ -240,28 +460,57 @@ function validateCommandRequirements(
   if (!isKnownCommand(command)) {
     throw new ClawpatchError(`unknown command: ${command}`, 2, "invalid-usage");
   }
-  const required = requiredCommandFlags[command] ?? [];
+  const spec: CommandSpec = commandSpecs[command];
+  const required = spec.required ?? [];
   for (const flag of required) {
     if (typeof flags[flag] !== "string" || flags[flag].length === 0) {
       throw new ClawpatchError(`missing --${kebab(flag)}`, 2, "invalid-usage");
     }
   }
+  spec.validate?.(flags);
+}
+
+function validateRevalidateFlags(flags: Flags): void {
   if (
-    command === "revalidate" &&
     typeof flags["finding"] !== "string" &&
     flags["all"] !== true &&
-    typeof flags["since"] !== "string"
+    typeof flags["since"] !== "string" &&
+    flags["includeDirty"] !== true
   ) {
     throw new ClawpatchError("missing --finding or --all", 2, "invalid-usage");
   }
 }
 
-function isKnownCommand(command: string): command is keyof typeof commandFlags {
-  return Object.hasOwn(commandFlags, command);
+function validateReviewFlags(flags: Flags): void {
+  if (
+    typeof flags["mode"] === "string" &&
+    flags["mode"] !== "default" &&
+    flags["mode"] !== "deslopify"
+  ) {
+    throw new ClawpatchError("invalid --mode; expected default or deslopify", 2, "invalid-usage");
+  }
+  if (typeof flags["featureList"] === "string") {
+    for (const conflictingFlag of ["feature", "project", "since"] as const) {
+      if (typeof flags[conflictingFlag] === "string") {
+        throw new ClawpatchError(
+          `--feature-list cannot be combined with --${kebab(conflictingFlag)}`,
+          2,
+          "invalid-usage",
+        );
+      }
+    }
+    if (flags["includeDirty"] === true) {
+      throw new ClawpatchError(
+        "--feature-list cannot be combined with --include-dirty",
+        2,
+        "invalid-usage",
+      );
+    }
+  }
 }
 
-function isBooleanFlag(name: string): boolean {
-  return booleanFlagNames.has(name);
+function isKnownCommand(command: string): command is keyof typeof commandSpecs {
+  return Object.hasOwn(commandSpecs, command);
 }
 
 function readFlagValue(argv: string[], index: number, flag: string): string {
@@ -279,31 +528,18 @@ function isKnownOptionToken(value: string): boolean {
   return value.startsWith("--");
 }
 
-function setFlag(
-  target: Record<string, string | boolean>,
-  name: string,
+function setOption(
+  global: GlobalOptions,
+  flags: Record<string, string | boolean>,
+  option: OptionSpec,
   value: string | boolean,
 ): void {
-  target[name] = value;
-}
-
-function isGlobalFlag(name: string): name is keyof GlobalOptions {
-  return [
-    "root",
-    "stateDir",
-    "config",
-    "json",
-    "plain",
-    "quiet",
-    "verbose",
-    "debug",
-    "noColor",
-    "noInput",
-  ].includes(name);
-}
-
-function camel(value: string): string {
-  return value.replace(/-([a-z])/gu, (_match, letter: string) => letter.toUpperCase());
+  if (option.target === "global") {
+    const target = global as Record<string, string | boolean | undefined>;
+    target[option.name] = value;
+    return;
+  }
+  flags[option.name] = value;
 }
 
 function kebab(value: string): string {
@@ -344,212 +580,63 @@ function writeResult(result: unknown, options: GlobalOptions): void {
   process.stdout.write(`${String(result)}\n`);
 }
 
+export function helpText(command = ""): string {
+  if (isKnownCommand(command)) {
+    const spec: CommandSpec = commandSpecs[command];
+    const flagLines = [
+      ...spec.flags.map((flag) => spec.helpOverrides?.[flag] ?? optionHelp(flag)),
+      ...(spec.globalHelp ?? ["json"]).map(optionHelp),
+    ];
+    return [
+      `clawpatch ${command}`,
+      "",
+      "Usage:",
+      ...spec.usage.map((usage) => `  ${usage}`),
+      "",
+      "Flags:",
+      ...flagLines,
+      "",
+    ].join("\n");
+  }
+  const globalFlags = [
+    "root",
+    "stateDir",
+    "config",
+    "json",
+    "plain",
+    "quiet",
+    "verbose",
+    "debug",
+    "noColor",
+    "noInput",
+  ].map(optionHelp);
+  return [
+    "clawpatch: automated code review that lands fixes",
+    "",
+    "Usage:",
+    "  clawpatch [global flags] <command> [flags]",
+    "",
+    "Commands:",
+    ...Object.keys(commandSpecs).map((name) => `  ${name}`),
+    "",
+    "Global flags:",
+    ...globalFlags,
+    "  -h, --help",
+    "  --version",
+    "",
+  ].join("\n");
+}
+
+function optionHelp(name: string): string {
+  const option = optionSpecsByName.get(name);
+  if (option === undefined) {
+    throw new Error(`missing CLI option metadata: ${name}`);
+  }
+  return option.help;
+}
+
 function printHelp(command = ""): void {
-  if (command === "review") {
-    process.stdout.write(`clawpatch review
-
-Usage:
-  clawpatch review [flags]
-
-Flags:
-  --feature <id>
-  --project <name-or-root>
-  --limit <n>
-  --since <ref>
-  --jobs <n>        default: 10
-  --provider <name>
-  --model <name>
-  --dry-run
-  --json
-  -q, --quiet
-`);
-    return;
-  }
-  if (command === "report") {
-    process.stdout.write(`clawpatch report
-
-Usage:
-  clawpatch report [flags]
-
-Flags:
-  --status <status>
-  --severity <severity>
-  --feature <id>
-  --project <name-or-root>
-  --category <category>
-  --triage <triage>
-  --output <path>
-  --json
-`);
-    return;
-  }
-  if (command === "show") {
-    process.stdout.write(`clawpatch show
-
-Usage:
-  clawpatch show --finding <id> [flags]
-
-Flags:
-  --finding <id>
-  --json
-`);
-    return;
-  }
-  if (command === "next") {
-    process.stdout.write(`clawpatch next
-
-Usage:
-  clawpatch next [flags]
-
-Flags:
-  --status <status>  default: open
-  --project <name-or-root>
-  --json
-`);
-    return;
-  }
-  if (command === "triage") {
-    process.stdout.write(`clawpatch triage
-
-Usage:
-  clawpatch triage --finding <id> --status <status> [flags]
-
-Flags:
-  --finding <id>
-  --status <open|false-positive|fixed|wont-fix|uncertain>
-  --note <text>
-  --json
-`);
-    return;
-  }
-  if (command === "fix") {
-    process.stdout.write(`clawpatch fix
-
-Usage:
-  clawpatch fix --finding <id> [flags]
-
-Flags:
-  --finding <id>
-  --provider <name>
-  --model <name>
-  --dry-run
-  --json
-`);
-    return;
-  }
-  if (command === "init") {
-    process.stdout.write(`clawpatch init
-
-Usage:
-  clawpatch init [flags]
-
-Flags:
-  --force
-  --json
-`);
-    return;
-  }
-  if (command === "map") {
-    process.stdout.write(`clawpatch map
-
-Usage:
-  clawpatch map [flags]
-
-Flags:
-  --dry-run
-  --json
-`);
-    return;
-  }
-  if (command === "revalidate") {
-    process.stdout.write(`clawpatch revalidate
-
-Usage:
-  clawpatch revalidate --finding <id> [flags]
-  clawpatch revalidate --since <ref> [flags]
-
-Flags:
-  --finding <id>
-  --all
-  --status <status>
-  --severity <severity>
-  --feature <id>
-  --category <category>
-  --triage <triage>
-  --limit <n>
-  --since <ref>
-  --provider <name>
-  --model <name>
-  --json
-`);
-    return;
-  }
-  if (command === "status") {
-    process.stdout.write(`clawpatch status
-
-Usage:
-  clawpatch status [flags]
-
-Flags:
-  --json
-`);
-    return;
-  }
-  if (command === "doctor") {
-    process.stdout.write(`clawpatch doctor
-
-Usage:
-  clawpatch doctor [flags]
-
-Flags:
-  --json
-`);
-    return;
-  }
-  if (command === "clean-locks") {
-    process.stdout.write(`clawpatch clean-locks
-
-Usage:
-  clawpatch clean-locks [flags]
-
-Flags:
-  --json
-`);
-    return;
-  }
-  process.stdout.write(`clawpatch: automated code review that lands fixes
-
-Usage:
-  clawpatch [global flags] <command> [flags]
-
-Commands:
-  init
-  map
-  status
-  review
-  report
-  show
-  next
-  triage
-  fix
-  revalidate
-  doctor
-  clean-locks
-
-Global flags:
-  --root <path>
-  --state-dir <path>
-  --config <path>
-  --json
-  --plain
-  -q, --quiet
-  -v, --verbose
-  --debug
-  --no-color
-  --no-input
-  -h, --help
-  --version
-`);
+  process.stdout.write(helpText(command));
 }
 
 if (isMainModule()) {

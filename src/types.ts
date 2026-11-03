@@ -90,6 +90,18 @@ export const projectCommandsSchema = z.object({
 
 export type ProjectCommands = z.infer<typeof projectCommandsSchema>;
 
+export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+export const reasoningEffortSchema = z.enum(reasoningEfforts);
+
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
+const codexConfigValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
+export const codexConfigSchema = z.record(z.string(), codexConfigValueSchema);
+
+export type CodexConfig = z.infer<typeof codexConfigSchema>;
+
 export const projectRecordSchema = z.object({
   schemaVersion: z.literal(1),
   projectId: z.string(),
@@ -121,6 +133,8 @@ export const configSchema = z.object({
   provider: z.object({
     name: z.string(),
     model: z.string().nullable(),
+    reasoningEffort: reasoningEffortSchema.nullable().optional().default(null),
+    codexConfig: codexConfigSchema.optional().default({}),
   }),
   commands: projectCommandsSchema,
   review: z.object({
@@ -134,6 +148,19 @@ export const configSchema = z.object({
     commit: z.boolean(),
     openPr: z.boolean(),
   }),
+  /**
+   * Post-validation registry verifier — drops review findings that claim
+   * a package version is unpublished when the npm registry says
+   * otherwise. Explicit opt-in because lookups send package coordinates
+   * to the public npm registry. Only `verified-published`
+   * outcomes drop a finding; 404, network errors, and unknown responses
+   * keep it). See `src/registry-verifier.ts` for the verdict matrix.
+   */
+  registryVerifier: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({ enabled: false }),
 });
 
 export type ClawpatchConfig = z.infer<typeof configSchema>;
@@ -161,6 +188,7 @@ export const analysisEntrySchema = z.object({
   summary: z.string(),
   provider: z.string().nullable(),
   model: z.string().nullable(),
+  reasoningEffort: reasoningEffortSchema.nullable().optional().default(null),
   createdAt: z.string(),
 });
 
@@ -198,13 +226,21 @@ export type FeatureRecord = z.infer<typeof featureRecordSchema>;
 export type FeatureKind = FeatureRecord["kind"];
 export type TrustBoundary = FeatureRecord["trustBoundaries"][number];
 
-export const evidenceRefSchema = z.object({
-  path: z.string(),
-  startLine: z.number().int().positive().nullable(),
-  endLine: z.number().int().positive().nullable(),
-  symbol: z.string().nullable(),
-  quote: z.string().nullable(),
-});
+const evidenceLineSchema = z.number().int().min(0).nullable();
+
+export const evidenceRefSchema = z
+  .object({
+    path: z.string(),
+    startLine: evidenceLineSchema,
+    endLine: evidenceLineSchema,
+    symbol: z.string().nullable(),
+    quote: z.string().nullable(),
+  })
+  .transform((evidence) =>
+    evidence.startLine === 0 || evidence.endLine === 0
+      ? { ...evidence, startLine: null, endLine: null }
+      : evidence,
+  );
 
 export const findingHistoryEntrySchema = z.object({
   runId: z.string().nullable(),
@@ -279,6 +315,7 @@ export const patchAttemptSchema = z.object({
     .object({
       name: z.string(),
       model: z.string().nullable(),
+      reasoningEffort: reasoningEffortSchema.nullable().optional().default(null),
       requestId: z.string().nullable(),
       startedAt: z.string(),
       finishedAt: z.string(),
@@ -319,27 +356,60 @@ export const runRecordSchema = z.object({
 
 export type RunRecord = z.infer<typeof runRecordSchema>;
 
-export const reviewOutputSchema = z.object({
-  findings: z.array(
+export const agentMapOutputSchema = z.object({
+  features: z.array(
     z.object({
       title: z.string(),
-      category: z.enum(findingCategories),
-      severity: z.enum(["critical", "high", "medium", "low"]),
+      summary: z.string(),
+      kind: z.enum(featureKinds),
       confidence: z.enum(["high", "medium", "low"]),
-      evidence: z.array(evidenceRefSchema),
-      reasoning: z.string(),
-      reproduction: z.string().nullable(),
-      recommendation: z.string(),
-      whyTestsDoNotAlreadyCoverThis: z.string(),
-      suggestedRegressionTest: z.string().nullable(),
-      minimumFixScope: z.string(),
+      entrypoints: z.array(featureEntrypointSchema),
+      ownedFiles: z.array(featureFileRefSchema),
+      contextFiles: z.array(featureFileRefSchema),
+      tests: z.array(featureTestRefSchema),
+      tags: z.array(z.string()),
+      trustBoundaries: z.array(z.enum(trustBoundaries)),
+      reason: z.string(),
     }),
   ),
-  inspected: z.object({
-    files: z.array(z.string()),
-    symbols: z.array(z.string()),
-    notes: z.array(z.string()),
-  }),
+  notes: z.array(z.string()),
+});
+
+export type AgentMapOutput = z.infer<typeof agentMapOutputSchema>;
+
+export const reviewFindingSchema = z.object({
+  title: z.string(),
+  category: z.enum(findingCategories),
+  severity: z.enum(["critical", "high", "medium", "low"]),
+  confidence: z.enum(["high", "medium", "low"]),
+  evidence: z.array(evidenceRefSchema),
+  reasoning: z.string(),
+  reproduction: z
+    .string()
+    .nullish()
+    .transform((v) => v ?? null),
+  recommendation: z.string(),
+  whyTestsDoNotAlreadyCoverThis: z.string(),
+  suggestedRegressionTest: z.string().nullable(),
+  minimumFixScope: z
+    .string()
+    .nullish()
+    .transform((v) => v ?? ""),
+});
+
+export type ReviewFinding = z.infer<typeof reviewFindingSchema>;
+
+export const reviewInspectedSchema = z.object({
+  files: z.array(z.string()),
+  symbols: z.array(z.string()),
+  notes: z.array(z.string()),
+});
+
+export type ReviewInspected = z.infer<typeof reviewInspectedSchema>;
+
+export const reviewOutputSchema = z.object({
+  findings: z.array(reviewFindingSchema),
+  inspected: reviewInspectedSchema,
 });
 
 export type ReviewOutput = z.infer<typeof reviewOutputSchema>;
