@@ -1,0 +1,423 @@
+import { describe, expect, it } from "vitest";
+import { defaultConfig } from "./config.js";
+import { ClawpatchError } from "./errors.js";
+import type { ReviewPromptManifest } from "./prompt.js";
+import { validateReviewOutputPartitioned as validatePartitioned } from "./review-validation.js";
+import { fixtureRoot, writeFixture } from "./test-helpers.js";
+import type { FeatureRecord, ReviewOutput } from "./types.js";
+
+async function validateReviewOutput(
+  root: string,
+  _feature: FeatureRecord,
+  _config: ReturnType<typeof defaultConfig>,
+  reviewManifest: ReviewPromptManifest,
+  providerOutput: ReviewOutput,
+): Promise<ReviewOutput> {
+  const result = await validatePartitioned(root, reviewManifest, providerOutput);
+  const dropped = result.droppedFindings[0];
+  if (dropped !== undefined) {
+    throw new ClawpatchError(dropped.message, 8, "malformed-output");
+  }
+  return { ...providerOutput, findings: result.findings };
+}
+
+async function validateReviewOutputPartitioned(
+  root: string,
+  _feature: FeatureRecord,
+  _config: ReturnType<typeof defaultConfig>,
+  reviewManifest: ReviewPromptManifest,
+  providerOutput: ReviewOutput,
+) {
+  return validatePartitioned(root, reviewManifest, providerOutput);
+}
+
+describe("validateReviewOutput", () => {
+  it("accepts evidence that points at included files, existing lines, and matching quotes", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-ok-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts"),
+      ),
+    ).resolves.toMatchObject({ findings: [{ title: "Bug" }] });
+  });
+
+  it("does not reject absolute inspected file metadata", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-inspected-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+    const providerOutput = output("src/index.ts");
+    providerOutput.inspected.files = [`${root}/src/index.ts`];
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        providerOutput,
+      ),
+    ).resolves.toMatchObject({ findings: [{ title: "Bug" }] });
+  });
+
+  it("accepts evidence from linked tests included in review context", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-test-file-");
+    await writeFixture(root, "src/index.ts", "const value = 'safe';\n");
+    await writeFixture(root, "src/index.test.ts", "const value = 'TODO_BUG';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        {
+          ...feature("src/index.ts"),
+          tests: [{ path: "src/index.test.ts", command: null }],
+        },
+        defaultConfig(),
+        manifest("src/index.test.ts", { role: "test" }),
+        output("src/index.test.ts"),
+      ),
+    ).resolves.toMatchObject({ findings: [{ title: "Bug" }] });
+  });
+
+  it("accepts evidence from files selected after duplicate prompt refs are skipped", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-duplicate-context-");
+    await writeFixture(root, "src/index.ts", "const value = 'safe';\n");
+    await writeFixture(root, "src/context-one.ts", "const value = 'safe';\n");
+    await writeFixture(root, "src/context-two.ts", "const value = 'TODO_BUG';\n");
+    const config = defaultConfig();
+    config.review.maxContextFiles = 2;
+
+    await expect(
+      validateReviewOutput(
+        root,
+        {
+          ...feature("src/index.ts"),
+          contextFiles: [
+            { path: "src/index.ts", reason: "duplicate owned file" },
+            { path: "src/context-one.ts", reason: "context" },
+            { path: "src/context-two.ts", reason: "context" },
+          ],
+        },
+        config,
+        manifest("src/context-two.ts", { role: "context" }),
+        output("src/context-two.ts"),
+      ),
+    ).resolves.toMatchObject({ findings: [{ title: "Bug" }] });
+  });
+
+  it("rejects evidence for files that were not included in review context", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-path-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+    await writeFixture(root, "src/other.ts", "const value = 'TODO_BUG';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/other.ts"),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+
+  it("rejects stale line ranges and quotes that do not match current file text", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-content-");
+    await writeFixture(root, "src/index.ts", "const value = 'real';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts", { startLine: 9, endLine: 9, quote: "real" }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts", { startLine: 1, endLine: 1, quote: "missing" }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts", { startLine: 2, endLine: 2, quote: null }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+
+  it("rejects quotes that only match outside the cited line range", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-line-quote-");
+    await writeFixture(root, "src/index.ts", "const first = 'TODO_BUG';\nconst second = 'safe';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts", { startLine: 2, endLine: 2, quote: "TODO_BUG" }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+
+  it("rejects line-only evidence outside the included prompt range", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-prompt-range-");
+    await writeFixture(root, "src/index.ts", "const first = 'safe';\nconst second = 'TODO_BUG';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts", {
+          includedLineRanges: [{ startLine: 1, endLine: 1 }],
+        }),
+        output("src/index.ts", { startLine: 2, endLine: 2, quote: null }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+
+  it("rejects evidence without a line range or quote", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-empty-evidence-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts"),
+        output("src/index.ts", { startLine: null, endLine: null, quote: null }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+
+  it("rejects evidence that only exists beyond the truncated prompt text", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-truncated-");
+    await writeFixture(root, "src/index.ts", `${"a".repeat(24_000)}\nconst value = 'TODO_TAIL';\n`);
+
+    await expect(
+      validateReviewOutput(
+        root,
+        feature("src/index.ts"),
+        defaultConfig(),
+        manifest("src/index.ts", { truncated: true }),
+        output("src/index.ts", { startLine: null, endLine: null, quote: "TODO_TAIL" }),
+      ),
+    ).rejects.toMatchObject({ code: "malformed-output" });
+  });
+});
+
+describe("validateReviewOutputPartitioned", () => {
+  it("returns all findings when every finding's evidence is valid", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-partition-ok-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+
+    const result = await validateReviewOutputPartitioned(
+      root,
+      feature("src/index.ts"),
+      defaultConfig(),
+      manifest("src/index.ts"),
+      output("src/index.ts"),
+    );
+
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]!.title).toBe("Bug");
+    expect(result.droppedFindings).toEqual([]);
+  });
+
+  it("keeps valid siblings when one finding has a stale quote", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-partition-quote-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+
+    const goodFinding = output("src/index.ts").findings[0]!;
+    const badFinding: ReviewOutput["findings"][number] = {
+      ...goodFinding,
+      title: "Stale quote",
+      evidence: [
+        {
+          path: "src/index.ts",
+          startLine: 1,
+          endLine: 1,
+          symbol: null,
+          quote: "this text does not exist",
+        },
+      ],
+    };
+    const provider: ReviewOutput = {
+      findings: [goodFinding, badFinding, { ...goodFinding, title: "Also good" }],
+      inspected: { files: ["src/index.ts"], symbols: [], notes: [] },
+    };
+
+    const result = await validateReviewOutputPartitioned(
+      root,
+      feature("src/index.ts"),
+      defaultConfig(),
+      manifest("src/index.ts"),
+      provider,
+    );
+
+    expect(result.findings.map((f) => f.title)).toEqual(["Bug", "Also good"]);
+    expect(result.droppedFindings).toHaveLength(1);
+    const dropped = result.droppedFindings[0]!;
+    expect(dropped.path).toEqual(["findings", 1]);
+    expect(dropped.layer).toBe("validation");
+    expect(dropped.message).toMatch(/quote/iu);
+    expect(dropped.sample.length).toBeLessThanOrEqual(200);
+  });
+
+  it("drops findings whose evidence file was not included in the prompt", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-partition-included-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+    await writeFixture(root, "src/other.ts", "const value = 'TODO_BUG';\n");
+
+    const result = await validateReviewOutputPartitioned(
+      root,
+      feature("src/index.ts"),
+      defaultConfig(),
+      manifest("src/index.ts"),
+      output("src/other.ts"),
+    );
+
+    expect(result.findings).toEqual([]);
+    expect(result.droppedFindings).toHaveLength(1);
+    expect(result.droppedFindings[0]!.layer).toBe("validation");
+    expect(result.droppedFindings[0]!.message).toMatch(/not included/iu);
+  });
+
+  it("drops findings with empty evidence arrays without throwing", async () => {
+    const root = await fixtureRoot("clawpatch-review-validation-partition-empty-");
+    await writeFixture(root, "src/index.ts", "const value = 'TODO_BUG';\n");
+
+    const goodFinding = output("src/index.ts").findings[0]!;
+    const provider: ReviewOutput = {
+      findings: [{ ...goodFinding, title: "No evidence", evidence: [] }, goodFinding],
+      inspected: { files: ["src/index.ts"], symbols: [], notes: [] },
+    };
+
+    const result = await validateReviewOutputPartitioned(
+      root,
+      feature("src/index.ts"),
+      defaultConfig(),
+      manifest("src/index.ts"),
+      provider,
+    );
+
+    expect(result.findings.map((f) => f.title)).toEqual(["Bug"]);
+    expect(result.droppedFindings).toHaveLength(1);
+    expect(result.droppedFindings[0]!.path).toEqual(["findings", 0]);
+    expect(result.droppedFindings[0]!.message).toMatch(/no evidence/iu);
+  });
+});
+
+function feature(path: string): FeatureRecord {
+  return {
+    schemaVersion: 1,
+    featureId: "feat_test",
+    title: "Test feature",
+    summary: "Test feature.",
+    kind: "library",
+    source: "test",
+    confidence: "high",
+    entrypoints: [{ path, symbol: null, route: null, command: null }],
+    ownedFiles: [{ path, reason: "test" }],
+    contextFiles: [],
+    tests: [],
+    tags: [],
+    trustBoundaries: [],
+    status: "pending",
+    lock: null,
+    findingIds: [],
+    patchAttemptIds: [],
+    analysisHistory: [],
+    createdAt: "2026-05-18T00:00:00.000Z",
+    updatedAt: "2026-05-18T00:00:00.000Z",
+  };
+}
+
+function output(
+  path: string,
+  evidence: {
+    startLine?: number | null;
+    endLine?: number | null;
+    quote?: string | null;
+  } = {},
+): ReviewOutput {
+  return {
+    findings: [
+      {
+        title: "Bug",
+        category: "bug",
+        severity: "medium",
+        confidence: "high",
+        evidence: [
+          {
+            path,
+            startLine: "startLine" in evidence ? evidence.startLine! : 1,
+            endLine: "endLine" in evidence ? evidence.endLine! : 1,
+            symbol: null,
+            quote: "quote" in evidence ? evidence.quote! : "TODO_BUG",
+          },
+        ],
+        reasoning: "Reason.",
+        reproduction: null,
+        recommendation: "Fix it.",
+        whyTestsDoNotAlreadyCoverThis: "No test.",
+        suggestedRegressionTest: null,
+        minimumFixScope: "Small.",
+      },
+    ],
+    inspected: { files: [path], symbols: [], notes: [] },
+  };
+}
+
+function manifest(
+  path: string,
+  options: {
+    truncated?: boolean;
+    readable?: boolean;
+    includedLineRanges?: Array<{ startLine: number; endLine: number }>;
+    role?: "owned" | "context" | "test";
+  } = {},
+): ReviewPromptManifest {
+  const readable = options.readable ?? true;
+  const includedLineRanges = readable
+    ? (options.includedLineRanges ?? [{ startLine: 1, endLine: 1 }])
+    : [];
+  return {
+    maxOwnedFiles: defaultConfig().review.maxOwnedFiles,
+    maxContextFiles: defaultConfig().review.maxContextFiles,
+    includedFiles: [
+      {
+        path,
+        role: options.role ?? "owned",
+        bytes: readable ? 1 : 0,
+        includedBytes: readable ? 1 : 0,
+        includedStartLine: includedLineRanges[0]?.startLine ?? null,
+        includedEndLine: includedLineRanges.at(-1)?.endLine ?? null,
+        includedLineRanges,
+        truncated: options.truncated ?? false,
+        readable,
+        skippedReason: readable ? null : "unreadable",
+      },
+    ],
+    omittedFiles: [],
+    promptBytes: 1,
+    approximateTokens: 1,
+  };
+}
