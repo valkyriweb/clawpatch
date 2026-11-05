@@ -216,8 +216,6 @@ export const findingHistoryEntrySchema = z.object({
   createdAt: z.string(),
 });
 
-export type FindingHistoryEntry = z.infer<typeof findingHistoryEntrySchema>;
-
 export const findingRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
