@@ -32,7 +32,9 @@ Default shape:
   ],
   "provider": {
     "name": "codex",
-    "model": null
+    "model": null,
+    "reasoningEffort": null,
+    "codexConfig": {}
   },
   "commands": {
     "typecheck": null,
@@ -50,15 +52,56 @@ Default shape:
     "requireCleanWorktreeForFix": true,
     "commit": false,
     "openPr": false
+  },
+  "registryVerifier": {
+    "enabled": false
   }
 }
 ```
+
+`registryVerifier.enabled` controls the npm-registry post-validator that
+drops direct `pkg@semver` public-npm publication claims refuted by
+the public npm registry. It is disabled by default because lookups disclose
+package coordinates; set it to `true` only when that network access is acceptable. See
+[Code review > Registry verifier](code-review.md#registry-verifier) for
+the full verdict matrix.
+
+Go package discovery has a two-minute deadline. `CLAWPATCH_GO_LIST_TIMEOUT_MS`
+accepts `1` through `2147483647` milliseconds; invalid values fall back to two
+minutes and fractional values are truncated. If `go list` times out, Clawpatch
+discards incomplete output and maps packages from repository files instead.
+Process cleanup can add a bounded delay after the discovery deadline.
 
 Environment overrides:
 
 - `CLAWPATCH_STATE_DIR`
 - `CLAWPATCH_PROVIDER`
 - `CLAWPATCH_MODEL`
+- `CLAWPATCH_REASONING_EFFORT`
+- `CLAWPATCH_CLAUDE_AUTH_CONTEXT` (`isolated` or `host`; default `isolated`)
+- `CLAWPATCH_GO_LIST_TIMEOUT_MS` (Go discovery deadline; default `120000`, or 2 minutes)
+- `CLAWPATCH_GIT_PUSH_TIMEOUT_MS` (default `600000`, or 10 minutes)
+- `CLAWPATCH_GH_PR_CREATE_TIMEOUT_MS` (default `300000`, or 5 minutes)
+- `CLAWPATCH_TASKKILL_TIMEOUT_MS` (Windows cleanup deadline; default `5000`, or 5 seconds)
 
-`git.commit` and `git.openPr` are reserved config fields. The current CLI does
-not commit or open PRs.
+Provider, validation, and `open-pr` timeout overrides accept `1` through
+`2147483647` milliseconds. Invalid or out-of-range values fall back to their
+defaults; fractional values are truncated. This prevents Node from turning an
+overflowing deadline into a one-millisecond timer.
+
+`CLAWPATCH_TASKKILL_TIMEOUT_MS` must be between `1` and `2147483647` milliseconds;
+invalid values fall back to 5 seconds. Fractional values are truncated. Each Windows
+process-tree cleanup attempt is bounded independently of the command deadline.
+If cleanup fails or times out, Clawpatch also terminates the direct child; descendant
+cleanup remains best effort when `taskkill` is unavailable or hung.
+
+`provider.codexConfig` passes primitive values to Codex as `-c key=value`.
+Only config loaded by `--config` or `CLAWPATCH_CONFIG` may set non-empty
+Codex passthrough config. Auto-discovered repository and state config files
+are rejected if they set it, because Codex config can change provider routing
+and credential lookup. Keep secrets out of config files; use Codex provider
+settings such as `env_key` to read an already-exported environment variable.
+
+`git.commit` and `git.openPr` are reserved config fields and do not enable
+automation. Commit and PR creation require the explicit
+[`open-pr` command](patching.md#opening-a-pr).

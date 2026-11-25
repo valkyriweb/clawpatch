@@ -1,10 +1,14 @@
-import { mkdtemp, writeFile, mkdir } from "node:fs/promises";
+import { onTestFinished } from "vitest";
+import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GlobalOptions } from "./config.js";
 
 export async function fixtureRoot(prefix: string): Promise<string> {
-  return mkdtemp(join(tmpdir(), prefix));
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  // Git pack files can briefly race with fixture teardown.
+  onTestFinished(() => rm(root, { recursive: true, force: true, maxRetries: 3 }));
+  return root;
 }
 
 export async function writeFixture(root: string, path: string, contents: string): Promise<void> {

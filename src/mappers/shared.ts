@@ -2,57 +2,181 @@ import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { pathExists } from "../fs.js";
 import { TrustBoundary } from "../types.js";
-import { FeatureSeed } from "./types.js";
+import { FeatureSeed, SeedFileRef } from "./types.js";
 
 export type TestRef = {
   path: string;
   command: string | null;
 };
 
+export type PathFilters = {
+  include: string[];
+  exclude: string[];
+};
+
+type WalkFiles = typeof walk;
+type NearbyTestFinder = (
+  entryPath: string,
+  testCommand: string | null,
+  seedTestPrefixes: string[],
+  seedTestNames?: string[],
+) => Promise<TestRef[]>;
+
+export function createNearbyTestFinder(
+  root: string,
+  walkFiles: WalkFiles = walk,
+): NearbyTestFinder {
+  const walks = new Map<string, Promise<string[]>>();
+  return (entryPath, testCommand, seedTestPrefixes, seedTestNames = []) =>
+    nearbyTests(
+      root,
+      entryPath,
+      testCommand,
+      seedTestPrefixes,
+      seedTestNames,
+      async (_root, prefixes, skipPath) => {
+        const skipPolicy = skipPath === shouldSkipCOrCppNearbyPath ? "c-cpp" : "default";
+        const files = await Promise.all(
+          prefixes.map((prefix) => {
+            const key = `${skipPolicy}\0${prefix}`;
+            let pending = walks.get(key);
+            if (pending === undefined) {
+              pending = walkFiles(root, [prefix], skipPath);
+              walks.set(key, pending);
+            }
+            return pending;
+          }),
+        );
+        return [...new Set(files.flat())].toSorted();
+      },
+    );
+}
+
+export function applyPathFilters(paths: string[], filters: PathFilters | undefined): string[] {
+  if (filters === undefined) {
+    return paths;
+  }
+  return paths.filter((path) => pathMatchesFilters(path, filters));
+}
+
+export function pathMatchesFilters(path: string, filters: PathFilters): boolean {
+  return (
+    filters.include.some((pattern) => pathPatternMatches(pattern, path)) &&
+    !filters.exclude.some((pattern) => pathPatternMatches(pattern, path))
+  );
+}
+
+function pathPatternMatches(pattern: string, path: string): boolean {
+  const normalized = pattern.replace(/\\/gu, "/").replace(/^\.\//u, "");
+  if (normalized === "**" || normalized === "**/*") {
+    return true;
+  }
+  if (normalized.length === 0) {
+    return false;
+  }
+  if (!/[?*]/u.test(normalized)) {
+    return path === normalized || path.startsWith(`${normalized}/`);
+  }
+  if (normalized.endsWith("/**")) {
+    const prefix = normalized.slice(0, -3);
+    if (/[?*]/u.test(prefix)) {
+      return new RegExp(`^${globPatternRegExp(prefix)}(?:/.*)?$`, "u").test(path);
+    }
+    return prefix.length === 0 || path === prefix || path.startsWith(`${prefix}/`);
+  }
+  return new RegExp(`^${globPatternRegExp(normalized)}$`, "u").test(path);
+}
+
+function globPatternRegExp(pattern: string): string {
+  let source = "";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === "*") {
+      if (pattern[index + 1] === "*") {
+        if (pattern[index + 2] === "/") {
+          source += "(?:.*/)?";
+          index += 2;
+        } else {
+          source += ".*";
+          index += 1;
+        }
+      } else {
+        source += "[^/]*";
+      }
+    } else if (char === "?") {
+      source += "[^/]";
+    } else {
+      source += regexpEscape(char ?? "");
+    }
+  }
+  return source;
+}
+
+function regexpEscape(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/gu, "\\$&");
+}
+
 export async function nearbyTests(
   root: string,
   entryPath: string,
   testCommand: string | null,
   seedTestPrefixes: string[],
+  seedTestNames: string[] = [],
+  walkFiles: WalkFiles = walk,
 ): Promise<TestRef[]> {
   const dir = dirname(entryPath);
   const base = entryPath.replace(/\.[^.]+$/u, "");
   const rustTestPrefixes = rustTestPrefixesForEntry(entryPath);
-  const all = await walk(root, [
-    dir === "." ? "" : dir,
-    "test",
-    "Tests",
-    "tests",
-    "__tests__",
-    "src",
-    ...rustTestPrefixes,
-    ...seedTestPrefixes,
-  ]);
+  const isRustEntry = entryPath.endsWith(".rs");
+  const isSwiftEntry = entryPath.endsWith(".swift");
+  const isCOrCppEntry = isCOrCppPath(entryPath);
+  const all = await walkFiles(
+    root,
+    [
+      dir === "." ? "" : dir,
+      "test",
+      "Tests",
+      "tests",
+      "__tests__",
+      "src",
+      ...rustTestPrefixes,
+      ...seedTestPrefixes,
+    ],
+    isCOrCppEntry ? shouldSkipCOrCppNearbyPath : shouldSkip,
+  );
   const stem =
     entryPath
       .split("/")
       .at(-1)
       ?.replace(/\.[^.]+$/u, "") ?? "";
+  const stemTestName = testNameToken(stem);
   const swiftTestPrefixes = seedTestPrefixes.length > 0 ? [] : swiftTestPrefixesForEntry(entryPath);
-  const isRustEntry = entryPath.endsWith(".rs");
-  const isSwiftEntry = entryPath.endsWith(".swift");
+  const cOrCppTestNames = seedTestNames.map(testNameToken).filter((name) => name.length > 0);
   const tests = all
     .filter((path) => path !== entryPath)
     .filter(
       (path) =>
         (isRustEntry && path.endsWith(".rs") && isTestPath(path)) ||
+        (isCOrCppEntry && isCOrCppPath(path) && isCOrCppTestPath(path)) ||
         (isSwiftEntry &&
           path.endsWith(".swift") &&
           (isTestPath(path) ||
             seedTestPrefixes.some((prefix) => pathMatchesPrefix(path, prefix)))) ||
-        (!isRustEntry && !isSwiftEntry && isJsTestPath(path)),
+        (!isRustEntry && !isSwiftEntry && !isCOrCppEntry && isJsTestPath(path)),
     )
     .filter(
       (path) =>
         path.startsWith(base) ||
-        path.includes(stem) ||
+        (!isCOrCppEntry && path.includes(stem)) ||
+        (isCOrCppEntry &&
+          stemTestName !== "main" &&
+          stemTestName.length > 0 &&
+          pathMatchesTestName(path, stemTestName)) ||
         (path.endsWith(".rs") &&
           rustTestPrefixes.some((prefix) => pathMatchesPrefix(path, prefix))) ||
+        (isCOrCppPath(path) &&
+          seedTestPrefixes.some((prefix) => pathMatchesPrefix(path, prefix))) ||
+        (isCOrCppPath(path) && cOrCppTestNames.some((name) => pathMatchesTestName(path, name))) ||
         (path.endsWith(".swift") &&
           seedTestPrefixes.some((prefix) => pathMatchesPrefix(path, prefix))) ||
         (path.endsWith(".swift") &&
@@ -62,10 +186,37 @@ export async function nearbyTests(
   return tests.map((path) => ({ path, command: testCommand }));
 }
 
-export async function walk(root: string, prefixes: string[]): Promise<string[]> {
-  const files: string[] = [];
-  const seen = new Set<string>();
-  const seenRoots = new Set<string>();
+export async function walk(
+  root: string,
+  prefixes: string[],
+  skipPath: (path: string) => boolean = shouldSkip,
+): Promise<string[]> {
+  const files = await walkByPolicy(root, prefixes, [{ key: "default", skipPath }]);
+  return files.get("default") ?? [];
+}
+
+export type WalkPolicy<Key extends string> = {
+  key: Key;
+  skipPath(path: string): boolean;
+};
+
+type WalkPolicyState<Key extends string> = WalkPolicy<Key> & {
+  files: string[];
+  seen: Set<string>;
+  seenRoots: Set<string>;
+};
+
+export async function walkByPolicy<Key extends string>(
+  root: string,
+  prefixes: string[],
+  policies: readonly WalkPolicy<Key>[],
+): Promise<Map<Key, string[]>> {
+  const states: WalkPolicyState<Key>[] = policies.map((policy) => ({
+    ...policy,
+    files: [],
+    seen: new Set<string>(),
+    seenRoots: new Set<string>(),
+  }));
   const realRoot = await realpath(root).catch(() => root);
   for (const prefix of prefixes) {
     const start = join(root, prefix);
@@ -85,26 +236,33 @@ export async function walk(root: string, prefixes: string[]): Promise<string[]> 
     }
     const rel = normalize(relative(realRoot, canonicalStart));
     if (info.isFile()) {
-      if (!seen.has(rel) && !shouldSkip(rel)) {
-        seen.add(rel);
-        files.push(rel);
+      for (const state of states) {
+        if (!state.seen.has(rel) && !state.skipPath(rel)) {
+          state.seen.add(rel);
+          state.files.push(rel);
+        }
       }
       continue;
     }
-    if (!info.isDirectory() || seenRoots.has(canonicalStart)) {
+    if (!info.isDirectory()) {
       continue;
     }
-    seenRoots.add(canonicalStart);
-    await walkDir(realRoot, canonicalStart, files, seen);
+    const rootStates = states.filter((state) => !state.seenRoots.has(canonicalStart));
+    if (rootStates.length === 0) {
+      continue;
+    }
+    for (const state of rootStates) {
+      state.seenRoots.add(canonicalStart);
+    }
+    await walkDirByPolicy(realRoot, canonicalStart, rootStates);
   }
-  return files.toSorted();
+  return new Map(states.map((state) => [state.key, state.files.toSorted()]));
 }
 
-async function walkDir(
+async function walkDirByPolicy<Key extends string>(
   root: string,
   dir: string,
-  files: string[],
-  seen: Set<string>,
+  states: WalkPolicyState<Key>[],
 ): Promise<void> {
   const dirInfo = await lstat(dir);
   if (dirInfo.isSymbolicLink()) {
@@ -115,25 +273,33 @@ async function walkDir(
     return;
   }
   const relDir = normalize(relative(root, dir));
-  if (shouldSkip(relDir)) {
+  const activeStates = states.filter((state) => !state.skipPath(relDir));
+  if (activeStates.length === 0) {
     return;
   }
   const entries = await readdir(dir);
   for (const entry of entries) {
     const full = join(dir, entry);
     const rel = normalize(relative(root, full));
-    if (seen.has(rel) || shouldSkip(rel)) {
+    const entryStates = activeStates.filter(
+      (state) => !state.seen.has(rel) && !state.skipPath(rel),
+    );
+    if (entryStates.length === 0) {
       continue;
     }
-    seen.add(rel);
+    for (const state of entryStates) {
+      state.seen.add(rel);
+    }
     const info = await lstat(full);
     if (info.isSymbolicLink()) {
       continue;
     }
     if (info.isDirectory()) {
-      await walkDir(root, full, files, seen);
+      await walkDirByPolicy(root, full, entryStates);
     } else if (info.isFile()) {
-      files.push(rel);
+      for (const state of entryStates) {
+        state.files.push(rel);
+      }
     }
   }
 }
@@ -172,7 +338,7 @@ export function shouldSkip(path: string): boolean {
     return false;
   }
   return (
-    /(^|\/)(node_modules|dist|build|coverage|\.build|\.git|\.clawpatch|\.worktrees)(\/|$)/u.test(
+    /(^|\/)(node_modules|dist|build|coverage|\.build|\.git|\.clawpatch|\.worktrees|\.turbo|\.next|\.vercel|\.venv(?:-[^/]+)?|venv|Pods|Carthage|SourcePackages|DerivedData|__pycache__)(\/|$)/u.test(
       path,
     ) ||
     path === "target" ||
@@ -214,20 +380,27 @@ export function normalize(path: string): string {
   return path.split(sep).join("/");
 }
 
-export function stripLineComments(source: string, marker: "#" | "//"): string {
-  return source
-    .split("\n")
-    .map((line) => stripLineComment(line, marker))
-    .join("\n");
-}
-
-export function stripSwiftComments(source: string): string {
-  return stripLineComments(stripBlockComments(source), "//");
-}
-
 export function pathMatchesPrefix(path: string, prefix: string): boolean {
   const normalized = normalize(prefix).replace(/\/$/u, "");
   return normalized === "" || path === normalized || path.startsWith(`${normalized}/`);
+}
+
+function pathMatchesTestName(path: string, name: string): boolean {
+  const normalized = testNameToken(path.replace(/\.[^.]+$/u, ""));
+  return (
+    normalized === name ||
+    normalized.startsWith(`${name}_`) ||
+    normalized.endsWith(`_${name}`) ||
+    normalized.includes(`_${name}_`)
+  );
+}
+
+function testNameToken(name: string): string {
+  return name
+    .replace(/\.[^.]+$/u, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "");
 }
 
 function isTestPath(path: string): boolean {
@@ -242,6 +415,58 @@ function isTestPath(path: string): boolean {
 
 function isJsTestPath(path: string): boolean {
   return /\.(test|spec)\.(ts|tsx|js|jsx)$/u.test(path);
+}
+
+export function isCOrCppPath(path: string): boolean {
+  return /\.(?:c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx)$/iu.test(path);
+}
+
+export function isCOrCppTestPath(path: string): boolean {
+  const base = path.split("/").at(-1) ?? path;
+  return (
+    /(^|\/)(test|tests|__tests__)\//iu.test(path) ||
+    /^test[_-]/iu.test(base) ||
+    /(?:^|[_-])tests?\./iu.test(base) ||
+    /Tests?\.[^.]+$/u.test(base)
+  );
+}
+
+export type LanguageTag = "c" | "cpp" | "cuda";
+
+export function languageTag(path: string): LanguageTag {
+  if (/\.cuh?$/iu.test(path)) {
+    return "cuda";
+  }
+  return /\.(?:C|H)$/u.test(path) || /\.(?:cc|cpp|cxx|hh|hpp|hxx)$/iu.test(path) ? "cpp" : "c";
+}
+
+export function languageLabel(tag: LanguageTag): string {
+  return tag === "cuda" ? "CUDA" : tag === "cpp" ? "C++" : "C";
+}
+
+export function targetLanguageTag(entryPath: string, sourcePaths: readonly string[]): LanguageTag {
+  if (sourcePaths.some((path) => languageTag(path) === "cuda")) {
+    return "cuda";
+  }
+  return languageTag(entryPath);
+}
+
+export function withCudaConcurrency(
+  boundaries: TrustBoundary[],
+  tag: LanguageTag,
+): TrustBoundary[] {
+  if (tag !== "cuda" || boundaries.includes("concurrency")) {
+    return boundaries;
+  }
+  return [...boundaries, "concurrency"];
+}
+
+function shouldSkipCOrCppNearbyPath(path: string): boolean {
+  return shouldSkip(path) || isCOrCppDependencyPath(path) || isSampleProjectPath(path);
+}
+
+function isCOrCppDependencyPath(path: string): boolean {
+  return /(^|\/)(deps|vendor|CMakeFiles|cmake-build-[^/]+)(\/|$)/u.test(path);
 }
 
 function swiftTestPrefixesForEntry(entryPath: string): string[] {
@@ -271,75 +496,15 @@ function rustTestPrefixesForEntry(entryPath: string): string[] {
   return ["tests/"];
 }
 
-function stripBlockComments(source: string): string {
-  let output = "";
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    const next = source[index + 1];
-    if (inString) {
-      output += char;
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
+export function uniqueFileRefs(refs: SeedFileRef[]): SeedFileRef[] {
+  const seen = new Set<string>();
+  const output: SeedFileRef[] = [];
+  for (const ref of refs) {
+    if (seen.has(ref.path)) {
       continue;
     }
-    if (char === '"') {
-      inString = true;
-      output += char;
-    } else if (char === "/" && next === "*") {
-      let depth = 1;
-      output += "  ";
-      index += 2;
-      while (index < source.length && depth > 0) {
-        if (source[index] === "/" && source[index + 1] === "*") {
-          output += "  ";
-          depth += 1;
-          index += 2;
-          continue;
-        }
-        if (source[index] === "*" && source[index + 1] === "/") {
-          output += "  ";
-          depth -= 1;
-          index += 2;
-          continue;
-        }
-        output += source[index] === "\n" ? "\n" : " ";
-        index += 1;
-      }
-      index -= 1;
-    } else {
-      output += char;
-    }
+    seen.add(ref.path);
+    output.push(ref);
   }
   return output;
-}
-
-function stripLineComment(line: string, marker: "#" | "//"): string {
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-    } else if (line.startsWith(marker, index)) {
-      return line.slice(0, index);
-    }
-  }
-  return line;
 }
